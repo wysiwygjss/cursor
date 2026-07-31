@@ -340,6 +340,8 @@ function Register-AutoStartTask {
                 -Description "KeyHunt v3 - auto-start at logon, resume highest SUB per segment"
         }
         catch {
+            Warn "Register-ScheduledTask failed; trying schtasks..."
+            if (Register-AutoStartViaSchTasks) { return $true }
             Write-Host "Could not register scheduled task: $($_.Exception.Message)" -ForegroundColor Red
             Write-Host "Scan will still run now. For auto-start after reboot:" -ForegroundColor Yellow
             Write-Host "  1) Right-click PowerShell -> Run as administrator, then run with -RegisterAutoStart" -ForegroundColor Yellow
@@ -351,6 +353,17 @@ function Register-AutoStartTask {
     Write-Host "Registered '$taskName' -> v3.ps1" -ForegroundColor Green
     Write-Host "  startIndex=$startIndex saveIntervalHours=$saveIntervalHours mode=$mode"
     return $true
+}
+
+function Register-AutoStartViaSchTasks {
+    $tr = "powershell.exe $argString"
+    schtasks /Delete /TN $taskName /F 2>$null | Out-Null
+    schtasks /Create /TN $taskName /TR $tr /SC ONLOGON /RL LIMITED /F 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Registered '$taskName' via schtasks (starts at logon)." -ForegroundColor Green
+        return $true
+    }
+    return $false
 }
 
 function Unregister-AutoStartTask {
@@ -429,7 +442,7 @@ function Run-Scan([bool]$explicitStartSub) {
             else {
                 $sub = $state.NextSub
                 if ($state.LastSub -ge 0) {
-                    Info "Resume SEG $seg highest SUB $state.LastSub -> start SUB $sub"
+                    Info ("Resume SEG {0} highest SUB {1} -> start SUB {2}" -f $seg, $state.LastSub, $sub)
                 }
                 else {
                     Info "SEG $seg from SUB 0"
