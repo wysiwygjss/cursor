@@ -407,6 +407,8 @@ function Register-AutoStartTask {
     $argString = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptSelf`" -startIndex $startIndex -saveIntervalHours $saveIntervalHours -mode $mode"
     if ($startSub -ge 0) { $argString += " -startSub $startSub" }
     if ($targetFile) { $argString += " -targetFile `"$targetFile`"" }
+    if ($autoSubSize) { $argString += " -autoSubSize -hoursPerSub $hoursPerSub -keysPerSecond $keysPerSecond" }
+    elseif ($subCount -ne 53687) { $argString += " -subCount $subCount" }
 
     $action = New-ScheduledTaskAction `
         -Execute "powershell.exe" `
@@ -626,7 +628,14 @@ function Run-Scan([bool]$explicitStartSub) {
             continue
         }
 
-        $state = Get-ResumeState $segIdx
+        $segSubCount = Get-SegmentSubCount $segStartBig $segEndBig
+        $chunkKeys = Get-ChunkKeyCount
+
+        if ($autoSubSize) {
+            Info ("SEG ${segIdx}: $segSubCount subs (~${hoursPerSub}h each at $keysPerSecond keys/s)")
+        }
+
+        $state = Get-ResumeState $segIdx $segSubCount $segStartBig $segEndBig
         if ($state.Complete) {
             Info "SEG $segIdx complete - next segment"
             continue
@@ -641,48 +650,57 @@ function Run-Scan([bool]$explicitStartSub) {
         }
 
         if ($subStart -lt 0) { $subStart = 0 }
-        if ($subStart -ge $subCount) { continue }
+        if ($subStart -ge $segSubCount) { continue }
 
-        Info ("SEG {0} {1}:{2} | SUB {3}-{4}" -f $segIdx, $range.Start, $range.End, $subStart, ($subCount - 1))
+        Info ("SEG {0} {1}:{2} | SUB {3}-{4}" -f $segIdx, $range.Start, $range.End, $subStart, ($segSubCount - 1))
 
-        for ($s = $subStart; $s -lt $subCount; $s++) {
-            $subRange = Get-SubRange $segStartBig $segEndBig $s $subCount
-            $startHex = BigToHex $subRange.Start
-            $endHex   = BigToHex $subRange.End
-            $rangeStr = "${startHex}:${endHex}"
-            $outFile  = Join-Path $scanDir "seg${segIdx}_sub${s}_found.txt"
+        for ($s = $subStart; $s -lt $segSubCount; $s++) {
+            $subRange = Get-SubRange $segStartBig $segEndBig $s $segSubCount
+            $runStart = $subRange.Start
+            $runEnd = $subRange.End
 
-            if ($state.EndHex -and $s -eq $state.NextSub -and $startHex -ne $state.EndHex) {
-                Warn "SUB $s start $startHex != resume end $($state.EndHex) (subCount/range may have changed)"
+            if ($s -eq $state.NextSub -and $state.EndHex -and $state.Partial) {
+                $resumeEnd = HexToBig $state.EndHex
+                $runStart = $resumeEnd + 1
+                if ($runStart -gt $runEnd) { continue }
             }
 
-            Info "SEG $segIdx SUB $s/$($subCount - 1) $rangeStr"
+            $chunks = @(Get-RangeChunks $runStart $runEnd $chunkKeys)
+            foreach ($chunk in $chunks) {
+                $startHex = BigToHex $chunk.Start
+                $endHex   = BigToHex $chunk.End
+                $rangeStr = "${startHex}:${endHex}"
+                $outFile  = Join-Path $scanDir "seg${segIdx}_sub${s}_found.txt"
 
-            $exitCode = Invoke-KeyHunt $rangeStr $outFile $modeFlag
-            if ($exitCode -ne 0) {
-                Warn "KeyHunt failed SEG $segIdx SUB $s"
-                return $exitCode
-            }
+                Info ("SEG $segIdx SUB $s/$($segSubCount - 1) chunk $rangeStr")
 
-            if (Test-Path $outFile) {
-                $hits = Get-Content $outFile -ErrorAction SilentlyContinue
-                if ($hits) {
-                    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                    foreach ($hit in $hits) {
-                        if ($hit.Trim()) {
-                            $foundMsg = "[{0}] SEG {1} SUB {2} | {3}" -f $stamp, $segIdx, $s, $hit
-                            Add-Content -Path $foundLog -Value $foundMsg
-                            Ok "FOUND: $hit"
+                $exitCode = Invoke-KeyHunt $rangeStr $outFile $modeFlag
+                if ($exitCode -ne 0) {
+                    Warn "KeyHunt failed SEG $segIdx SUB $s"
+                    return $exitCode
+                }
+
+                if (Test-Path $outFile) {
+                    $hits = Get-Content $outFile -ErrorAction SilentlyContinue
+                    if ($hits) {
+                        $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                        foreach ($hit in $hits) {
+                            if ($hit.Trim()) {
+                                $foundMsg = "[{0}] SEG {1} SUB {2} | {3}" -f $stamp, $segIdx, $s, $hit
+                                Add-Content -Path $foundLog -Value $foundMsg
+                                Ok "FOUND: $hit"
+                            }
                         }
                     }
                 }
-            }
 
-            Save-Resume $resumeFile $segIdx $s ($startHex.ToUpper()) ($endHex.ToUpper())
+                Save-Resume $resumeFile $segIdx $s ($startHex.ToUpper()) ($endHex.ToUpper())
+                Ok ("Saved SEG $segIdx SUB $s through $endHex")
 
-            if (((Get-Date) - $checkpointTimer).TotalHours -ge $saveIntervalHours) {
-                Ok "Checkpoint SEG $segIdx SUB $s"
-                $checkpointTimer = Get-Date
+                if (((Get-Date) - $checkpointTimer).TotalHours -ge $saveIntervalHours) {
+                    Ok "Checkpoint SEG $segIdx SUB $s"
+                    $checkpointTimer = Get-Date
+                }
             }
         }
 
