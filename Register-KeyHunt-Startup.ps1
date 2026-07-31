@@ -1,5 +1,5 @@
-# Registers a Windows Task Scheduler job to auto-start the scanner after reboot / power failure.
-# Run once in an elevated PowerShell:  Set-ExecutionPolicy Bypass -Scope Process; .\Register-KeyHunt-Startup.ps1
+# One-time setup — auto-start after reboot (optional):
+#   powershell -ExecutionPolicy Bypass -File "C:\Users\Admin\Documents\KeyhuntSuite\Wrappers\Register-KeyHunt-Startup.ps1"
 
 param(
     [int]$startIndex = 7790,
