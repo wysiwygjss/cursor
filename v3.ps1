@@ -50,7 +50,7 @@ function Resolve-TargetFile {
         if (!$pick) { $pick = $found[0] }
         if ($pick.FullName -ne $defaultTarget) {
             Copy-Item -Path $pick.FullName -Destination $defaultTarget -Force
-            Info "Copied target to: $defaultTarget"
+            Write-Host "Copied target to: $defaultTarget" -ForegroundColor Cyan
         }
         return $defaultTarget
     }
