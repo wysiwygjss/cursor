@@ -210,18 +210,8 @@ function Register-AutoStartTask {
         return $false
     }
 
-    $args = @(
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-WindowStyle", "Hidden",
-        "-File", "`"$scriptPath`"",
-        "-startIndex", $startIndex,
-        "-saveIntervalHours", $saveIntervalHours,
-        "-mode", $mode
-    )
-    if ($startSub -ge 0) { $args += "-startSub"; $args += $startSub }
-
-    $argString = ($args -join ' ')
+    $argString = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -startIndex $startIndex -saveIntervalHours $saveIntervalHours -mode $mode"
+    if ($startSub -ge 0) { $argString += " -startSub $startSub" }
 
     $action = New-ScheduledTaskAction `
         -Execute "powershell.exe" `
@@ -279,8 +269,7 @@ if ($UnregisterAutoStart) {
 }
 
 if ($RegisterAutoStart) {
-    if (Register-AutoStartTask) { exit 0 }
-    exit 1
+    Register-AutoStartTask
 }
 
 # ==================== SCAN ====================
