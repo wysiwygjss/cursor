@@ -282,6 +282,15 @@ function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) 
 }
 
 # ==================== AUTO-START (reboot / crash) ====================
+function Invoke-SchTasks([string[]]$schArgs) {
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    & schtasks.exe @schArgs 2>&1 | Out-Null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $oldEap
+    return $code
+}
+
 function Register-AutoStartTask {
     if (!(Test-Path $scriptSelf)) {
         Write-Host "Script not found: $scriptSelf" -ForegroundColor Red
@@ -341,7 +350,7 @@ function Register-AutoStartTask {
         }
         catch {
             Warn "Register-ScheduledTask failed; trying schtasks..."
-            if (Register-AutoStartViaSchTasks) { return $true }
+            if (Register-AutoStartViaSchTasks $argString) { return $true }
             Write-Host "Could not register scheduled task: $($_.Exception.Message)" -ForegroundColor Red
             Write-Host "Scan will still run now. For auto-start after reboot:" -ForegroundColor Yellow
             Write-Host "  1) Right-click PowerShell -> Run as administrator, then run with -RegisterAutoStart" -ForegroundColor Yellow
@@ -355,7 +364,7 @@ function Register-AutoStartTask {
     return $true
 }
 
-function Register-AutoStartViaSchTasks {
+function Register-AutoStartViaSchTasks([string]$argString) {
     $tr = "powershell.exe $argString"
     schtasks /Delete /TN $taskName /F 2>$null | Out-Null
     schtasks /Create /TN $taskName /TR $tr /SC ONLOGON /RL LIMITED /F 2>$null | Out-Null
@@ -367,6 +376,7 @@ function Register-AutoStartViaSchTasks {
 }
 
 function Unregister-AutoStartTask {
+    schtasks /Delete /TN $taskName /F 2>$null | Out-Null
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existing) {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
