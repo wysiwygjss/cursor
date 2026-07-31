@@ -1,8 +1,10 @@
 # KeyHunt Segment Scanner v3 - production wrapper
 # Save as: C:\Users\Admin\Documents\KeyhuntSuite\Wrappers\v3.ps1
 #
-# Run:
-#   powershell -ExecutionPolicy Bypass -File "...\Wrappers\v3.ps1" -startIndex 7790 -saveIntervalHours 6 -RegisterAutoStart
+# Run (pick ONE):
+#   Double-click Run-V3.cmd
+#   powershell -NoProfile -ExecutionPolicy Bypass -File "...\Wrappers\v3.ps1" -startIndex 7790 -saveIntervalHours 6
+# Do NOT use:  & v3.ps1   (execution policy blocks unless you Bypass the current session)
 
 param(
     [int]$startIndex = -1,
@@ -268,8 +270,11 @@ function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) 
         }) -join ' '
         Info "KeyHunt: $cmdPreview"
 
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         & $exe @argList
+        $sw.Stop()
         $lastExit = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+        Info ("KeyHunt finished in {0:N1}s exit {1}" -f $sw.Elapsed.TotalSeconds, $lastExit)
         if ($lastExit -eq 0) { return 0 }
 
         Warn "KeyHunt exit $lastExit (attempt $attempt/$keyHuntRetries)"
