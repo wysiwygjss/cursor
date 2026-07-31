@@ -7,7 +7,10 @@ param(
     [double]$saveIntervalHours = 2,
     [int]$keyHuntRetries = 5,
     [int]$keyHuntRetryDelaySeconds = 60,
-    [int]$restartDelaySeconds = 30
+    [int]$restartDelaySeconds = 30,
+    [switch]$RegisterAutoStart,
+    [switch]$UnregisterAutoStart,
+    [string]$taskName = "KeyHunt Segment Scanner"
 )
 
 $ErrorActionPreference = "Stop"
@@ -193,6 +196,91 @@ function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) 
     }
 
     return $proc.ExitCode
+}
+
+# ==================== AUTO-START (reboot / crash) ====================
+function Register-AutoStartTask {
+    $scriptPath = $PSCommandPath
+    if (!$scriptPath) {
+        $scriptPath = Join-Path $wrapperDir "Run-KeyHunt-Service.ps1"
+    }
+
+    if (!(Test-Path $scriptPath)) {
+        Write-Host "Script not found: $scriptPath" -ForegroundColor Red
+        return $false
+    }
+
+    $args = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-WindowStyle", "Hidden",
+        "-File", "`"$scriptPath`"",
+        "-startIndex", $startIndex,
+        "-saveIntervalHours", $saveIntervalHours,
+        "-mode", $mode
+    )
+    if ($startSub -ge 0) { $args += "-startSub"; $args += $startSub }
+
+    $argString = ($args -join ' ')
+
+    $action = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument $argString `
+        -WorkingDirectory $wrapperDir
+
+    $triggerBoot  = New-ScheduledTaskTrigger -AtStartup
+    $triggerLogon = New-ScheduledTaskTrigger -AtLogOn
+
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
+        -RestartCount 999 `
+        -RestartInterval (New-TimeSpan -Minutes 1)
+
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId "$env:USERDOMAIN\$env:USERNAME" `
+        -LogonType Interactive `
+        -RunLevel Highest
+
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    }
+
+    Register-ScheduledTask `
+        -TaskName $taskName `
+        -Action $action `
+        -Trigger @($triggerBoot, $triggerLogon) `
+        -Settings $settings `
+        -Principal $principal `
+        -Description "KeyHunt segment scanner — auto-start after reboot, resume from Scanned_Segments"
+
+    Write-Host "Registered '$taskName' for auto-start after reboot." -ForegroundColor Green
+    Write-Host "  startIndex=$startIndex saveIntervalHours=$saveIntervalHours mode=$mode"
+    return $true
+}
+
+function Unregister-AutoStartTask {
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        Write-Host "Removed '$taskName'." -ForegroundColor Green
+    }
+    else {
+        Write-Host "Task '$taskName' not found." -ForegroundColor Yellow
+    }
+}
+
+if ($UnregisterAutoStart) {
+    Unregister-AutoStartTask
+    exit 0
+}
+
+if ($RegisterAutoStart) {
+    if (Register-AutoStartTask) { exit 0 }
+    exit 1
 }
 
 # ==================== SCAN ====================
