@@ -366,9 +366,9 @@ function Register-AutoStartTask {
 
 function Register-AutoStartViaSchTasks([string]$argString) {
     $tr = "powershell.exe $argString"
-    schtasks /Delete /TN $taskName /F 2>$null | Out-Null
-    schtasks /Create /TN $taskName /TR $tr /SC ONLOGON /RL LIMITED /F 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
+    Invoke-SchTasks @('/Delete', '/TN', $taskName, '/F') | Out-Null
+    $code = Invoke-SchTasks @('/Create', '/TN', $taskName, '/TR', $tr, '/SC', 'ONLOGON', '/RL', 'LIMITED', '/F')
+    if ($code -eq 0) {
         Write-Host "Registered '$taskName' via schtasks (starts at logon)." -ForegroundColor Green
         return $true
     }
@@ -376,7 +376,7 @@ function Register-AutoStartViaSchTasks([string]$argString) {
 }
 
 function Unregister-AutoStartTask {
-    schtasks /Delete /TN $taskName /F 2>$null | Out-Null
+    Invoke-SchTasks @('/Delete', '/TN', $taskName, '/F') | Out-Null
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existing) {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
@@ -393,9 +393,14 @@ if ($UnregisterAutoStart) {
 }
 
 if ($RegisterAutoStart) {
-    $registered = Register-AutoStartTask
-    if (!$registered) {
-        Warn "Auto-start not registered; continuing with scan."
+    try {
+        $registered = Register-AutoStartTask
+        if (!$registered) {
+            Warn "Auto-start not registered; continuing with scan."
+        }
+    }
+    catch {
+        Warn "Auto-start registration failed: $($_.Exception.Message); continuing with scan."
     }
 }
 
