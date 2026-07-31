@@ -11,8 +11,12 @@ There is no second script to choose from in this repo. Copy `v3.ps1` to:
 ## Start command
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:\Users\Admin\Documents\KeyhuntSuite\Wrappers\v3.ps1" -startIndex 7790 -saveIntervalHours 6 -RegisterAutoStart
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Admin\Documents\KeyhuntSuite\Wrappers\v3.ps1" -startIndex 7790 -saveIntervalHours 6 -RegisterAutoStart
 ```
+
+`-saveIntervalHours 6` sets both resume checkpoint interval and ~6-hour SUB size (unless you pass `-subCount 53687` for legacy tiny subs).
+
+Double-click `Run-V3.cmd` for the same settings without Task Scheduler registration.
 
 ## Resume behavior (Option B)
 
