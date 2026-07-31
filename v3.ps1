@@ -1,4 +1,4 @@
-# KeyHunt Segment Scanner v3 — production wrapper
+# KeyHunt Segment Scanner v3 - production wrapper
 # Save as: C:\Users\Admin\Documents\KeyhuntSuite\Wrappers\v3.ps1
 #
 # Run:
@@ -45,11 +45,7 @@ function Resolve-TargetFile {
 
     $candidates = @()
     if ($targetFile) { $candidates += $targetFile }
-    $candidates += @(
-        $defaultTarget
-        Join-Path $targetDir "hash16_sorted.bin"
-        Join-Path $targetDir "hash160_sorted.bin"
-    )
+    $candidates += $targetCandidates
 
     foreach ($path in $candidates) {
         if ($path -and (Test-Path $path)) { return $path }
@@ -126,7 +122,7 @@ function Get-SubRange(
     return @{ Start = $subStart; End = $subEnd }
 }
 
-# ==================== RESUME (max completed SUB — not last line) ====================
+# ==================== RESUME (max completed SUB - not last line) ====================
 # 7790,776,71DB28E0E60D099E5C,71DB28E2E60D429E62,07/13/2026 05:58:33
 function Parse-ResumeLine([string]$line) {
     if (!$line) { return $null }
@@ -426,7 +422,7 @@ function Run-Scan([bool]$explicitStartSub) {
         if (!$explicitStartSub) {
             $state = Get-ResumeState $seg
             if ($state.Complete) {
-                Warn "SEG $seg complete — advancing"
+                Warn "SEG $seg complete - advancing"
                 $next = Find-NextOpenSegment ($seg + 1) $segments.Count
                 if ($next.Found) {
                     $seg = $next.Index
@@ -441,7 +437,7 @@ function Run-Scan([bool]$explicitStartSub) {
             else {
                 $sub = $state.NextSub
                 if ($state.LastSub -ge 0) {
-                    Info "Resume SEG $seg highest SUB $state.LastSub → start SUB $sub"
+                    Info "Resume SEG $seg highest SUB $state.LastSub -> start SUB $sub"
                 }
                 else {
                     Info "SEG $seg from SUB 0"
@@ -496,7 +492,7 @@ function Run-Scan([bool]$explicitStartSub) {
 
         $state = Get-ResumeState $segIdx
         if ($state.Complete) {
-            Info "SEG $segIdx complete — next segment"
+            Info "SEG $segIdx complete - next segment"
             continue
         }
 
@@ -554,7 +550,7 @@ function Run-Scan([bool]$explicitStartSub) {
             }
         }
 
-        Ok "SEG $segIdx complete — next segment"
+        Ok "SEG $segIdx complete - next segment"
     }
 
     Ok "Scan finished."
@@ -581,10 +577,10 @@ while ($true) {
             Log "v3 finished normally."
             break
         }
-        Log "v3 exit $code — retry in ${restartDelaySeconds}s (resume from highest SUB)"
+        Log "v3 exit $code - retry in ${restartDelaySeconds}s (resume from highest SUB)"
     }
     catch {
-        Log "v3 error: $($_.Exception.Message) — retry in ${restartDelaySeconds}s (resume from highest SUB)"
+        Log "v3 error: $($_.Exception.Message) - retry in ${restartDelaySeconds}s (resume from highest SUB)"
         $useExplicitSub = $false
     }
     Start-Sleep -Seconds $restartDelaySeconds
