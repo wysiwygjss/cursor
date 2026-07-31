@@ -16,7 +16,8 @@ param(
     [int]$restartDelaySeconds = 30,
     [switch]$RegisterAutoStart,
     [switch]$UnregisterAutoStart,
-    [string]$taskName = "KeyHunt Segment Scanner"
+    [string]$taskName = "KeyHunt Segment Scanner",
+    [string]$targetFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,12 +27,42 @@ $wrapperDir  = "C:\Users\Admin\Documents\KeyhuntSuite\Wrappers"
 $scriptSelf  = if ($PSCommandPath) { $PSCommandPath } else { Join-Path $wrapperDir "v3.ps1" }
 $segmentFile = "C:\Users\Admin\Documents\KeyhuntSuite\segment71_10000.txt"
 $exe         = "C:\Users\Admin\Documents\KeyhuntSuite\Bin\KeyHunt-Cuda.exe"
-$targetFile  = "C:\Users\Admin\Documents\KeyhuntSuite\bitcoincore_utxo\hash160_sorted.bin"
+$targetDir   = "C:\Users\Admin\Documents\KeyhuntSuite\bitcoincore_utxo"
+$defaultTarget = Join-Path $targetDir "hash160_sorted.bin"
 $scanDir     = "C:\Users\Admin\Documents\KeyhuntSuite\Scanned_Segments"
 $foundLog    = Join-Path $scanDir "Found_All.txt"
 $scannedFile = Join-Path $scanDir "Scanned_Segments.txt"
 $logFile     = Join-Path $wrapperDir "runner.log"
 $mutexName   = "Global\KeyHuntSegmentScanner"
+
+function Resolve-TargetFile {
+    if ($targetFile -and (Test-Path $targetFile)) { return $targetFile }
+
+    $candidates = @()
+    if ($targetFile) { $candidates += $targetFile }
+    $candidates += @(
+        $defaultTarget
+        Join-Path $targetDir "hash16_sorted.bin"
+        Join-Path $targetDir "hash160_sorted.bin"
+    )
+
+    foreach ($path in $candidates) {
+        if ($path -and (Test-Path $path)) { return $path }
+    }
+
+    if (Test-Path $targetDir) {
+        $found = @(Get-ChildItem -Path $targetDir -Filter "*sorted*.bin" -File -ErrorAction SilentlyContinue)
+        if ($found.Count -eq 1) { return $found[0].FullName }
+        if ($found.Count -gt 1) {
+            $hash = @($found | Where-Object { $_.Name -match 'hash' })
+            if ($hash.Count -eq 1) { return $hash[0].FullName }
+        }
+    }
+
+    return $null
+}
+
+$targetFile = Resolve-TargetFile
 
 New-Item -ItemType Directory -Force -Path $wrapperDir | Out-Null
 
@@ -257,6 +288,7 @@ function Register-AutoStartTask {
 
     $argString = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptSelf`" -startIndex $startIndex -saveIntervalHours $saveIntervalHours -mode $mode"
     if ($startSub -ge 0) { $argString += " -startSub $startSub" }
+    if ($targetFile) { $argString += " -targetFile `"$targetFile`"" }
 
     $action = New-ScheduledTaskAction `
         -Execute "powershell.exe" `
@@ -356,10 +388,21 @@ function Run-Scan([bool]$explicitStartSub) {
         Write-Host "KeyHunt not found: $exe" -ForegroundColor Red
         return 1
     }
-    if (!(Test-Path $targetFile)) {
-        Write-Host "Target file missing: $targetFile" -ForegroundColor Red
+    if (!$targetFile) {
+        Write-Host "Target file not found. Expected one of:" -ForegroundColor Red
+        Write-Host "  $defaultTarget" -ForegroundColor Yellow
+        Write-Host "  $(Join-Path $targetDir 'hash16_sorted.bin')" -ForegroundColor Yellow
+        if (Test-Path $targetDir) {
+            Write-Host "Files in $targetDir :" -ForegroundColor Yellow
+            Get-ChildItem -Path $targetDir -Filter "*.bin" -File | ForEach-Object { Write-Host "  $($_.FullName)" }
+        }
+        else {
+            Write-Host "Folder missing: $targetDir" -ForegroundColor Yellow
+        }
+        Write-Host "Or pass exact path: -targetFile `"C:\path\to\your.bin`"" -ForegroundColor Cyan
         return 1
     }
+    Info "Target: $targetFile"
 
     $modeFlag = switch ($mode) {
         "uncompressed" { "-u" }
