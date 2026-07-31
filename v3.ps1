@@ -263,7 +263,6 @@ function Register-AutoStartTask {
         -Argument $argString `
         -WorkingDirectory $wrapperDir
 
-    $triggerBoot  = New-ScheduledTaskTrigger -AtStartup
     $triggerLogon = New-ScheduledTaskTrigger -AtLogOn
 
     $settings = New-ScheduledTaskSettingsSet `
@@ -274,25 +273,48 @@ function Register-AutoStartTask {
         -RestartCount 999 `
         -RestartInterval (New-TimeSpan -Minutes 1)
 
+  # Limited = no Administrator required (Highest needs elevated PowerShell)
     $principal = New-ScheduledTaskPrincipal `
         -UserId "$env:USERDOMAIN\$env:USERNAME" `
         -LogonType Interactive `
-        -RunLevel Highest
+        -RunLevel Limited
 
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existing) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     }
 
-    Register-ScheduledTask `
-        -TaskName $taskName `
-        -Action $action `
-        -Trigger @($triggerBoot, $triggerLogon) `
-        -Settings $settings `
-        -Principal $principal `
-        -Description "KeyHunt v3 — auto-start after reboot, resume highest SUB per segment"
+    try {
+        $triggerBoot = New-ScheduledTaskTrigger -AtStartup
+        Register-ScheduledTask `
+            -TaskName $taskName `
+            -Action $action `
+            -Trigger @($triggerBoot, $triggerLogon) `
+            -Settings $settings `
+            -Principal $principal `
+            -Description "KeyHunt v3 - auto-start after reboot, resume highest SUB per segment"
+    }
+    catch {
+        try {
+            Warn "Startup trigger needs Admin; registering logon-only task instead."
+            Register-ScheduledTask `
+                -TaskName $taskName `
+                -Action $action `
+                -Trigger $triggerLogon `
+                -Settings $settings `
+                -Principal $principal `
+                -Description "KeyHunt v3 - auto-start at logon, resume highest SUB per segment"
+        }
+        catch {
+            Write-Host "Could not register scheduled task: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Scan will still run now. For auto-start after reboot:" -ForegroundColor Yellow
+            Write-Host "  1) Right-click PowerShell -> Run as administrator, then run with -RegisterAutoStart" -ForegroundColor Yellow
+            Write-Host "  2) Or run without -RegisterAutoStart and start manually after reboot" -ForegroundColor Yellow
+            return $false
+        }
+    }
 
-    Write-Host "Registered '$taskName' → v3.ps1" -ForegroundColor Green
+    Write-Host "Registered '$taskName' -> v3.ps1" -ForegroundColor Green
     Write-Host "  startIndex=$startIndex saveIntervalHours=$saveIntervalHours mode=$mode"
     return $true
 }
@@ -314,7 +336,10 @@ if ($UnregisterAutoStart) {
 }
 
 if ($RegisterAutoStart) {
-    Register-AutoStartTask
+    $registered = Register-AutoStartTask
+    if (!$registered) {
+        Warn "Auto-start not registered; continuing with scan."
+    }
 }
 
 # ==================== SCAN ====================
