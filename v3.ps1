@@ -3,8 +3,9 @@
 #
 # Run (pick ONE):
 #   Double-click Run-V3.cmd
-#   powershell -NoProfile -ExecutionPolicy Bypass -File "...\Wrappers\v3.ps1" -startIndex 7790 -autoSubSize -hoursPerSub 2 -saveIntervalHours 2
-# Finish in-progress segment 7790 (old 53687 subs): add -subCount 53687 and omit -autoSubSize
+# ONE stable command (save + sub size = saveIntervalHours):
+#   powershell -NoProfile -ExecutionPolicy Bypass -File "...\Wrappers\v3.ps1" -startIndex 7790 -saveIntervalHours 6 -RegisterAutoStart
+# Old 53687 tiny subs only: add -subCount 53687 (no autoSubSize)
 # Do NOT use:  & v3.ps1   (execution policy blocks unless you Bypass the current session)
 
 param(
@@ -12,7 +13,7 @@ param(
     [int]$startSub   = -1,
     [int]$subCount   = 53687,
     [switch]$autoSubSize,
-    [double]$hoursPerSub = 2,
+    [double]$hoursPerSub = 0,
     [double]$keysPerSecond = 4629710000,
     [ValidateSet("compressed", "uncompressed", "both")]
     [string]$mode = "uncompressed",
@@ -25,6 +26,12 @@ param(
     [string]$taskName = "KeyHunt Segment Scanner",
     [string]$targetFile = ""
 )
+
+# -saveIntervalHours 6 => ~6h subs + resume save every ~6h (unless -subCount 53687 for old tiny subs)
+if ($hoursPerSub -le 0) { $hoursPerSub = $saveIntervalHours }
+if ($PSBoundParameters.ContainsKey('saveIntervalHours') -and !$PSBoundParameters.ContainsKey('subCount')) {
+    $autoSubSize = $true
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -541,7 +548,7 @@ function Run-Scan([bool]$explicitStartSub) {
     }
 
     $segments = @(Get-Content $segmentFile | Where-Object { $_.Trim() -and !$_.Trim().StartsWith("#") })
-    Info ("v3 | segments: {0} | floor: {1} | save every {2}h | sub ~{3}h" -f $segments.Count, $floorIndex, $saveIntervalHours, $(if ($autoSubSize) { $hoursPerSub } else { "fixed $subCount subs" }))
+    Info ("v3 | segments: {0} | floor: {1} | save+sub every {2}h | autoSubSize={3}" -f $segments.Count, $floorIndex, $saveIntervalHours, $autoSubSize)
     Info "Resume: highest completed SUB per segment (stray low lines ignored)"
 
     $seg = $startIndex
