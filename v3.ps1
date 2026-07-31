@@ -172,7 +172,7 @@ function Get-ResumeState([int]$segIdx) {
 
     $lastEntry = Get-LastResumeEntry $resumeFile $segIdx
     if ($lastEntry -and $lastEntry.SubIdx -lt $maxEntry.SubIdx) {
-        Warn "SEG $segIdx: last line SUB $($lastEntry.SubIdx) < highest SUB $($maxEntry.SubIdx) — using highest"
+        Warn "SEG ${segIdx}: last line SUB $($lastEntry.SubIdx) < highest SUB $($maxEntry.SubIdx) - using highest"
     }
 
     $state.LastSub = $maxEntry.SubIdx
@@ -488,7 +488,7 @@ function Run-Scan([bool]$explicitStartSub) {
 }
 
 # ==================== RUNNER ====================
-$explicitStartSub = $PSBoundParameters.ContainsKey('startSub') -and $startSub -ge 0
+$explicitStartSub = $PSBoundParameters.ContainsKey("startSub") -and $startSub -ge 0
 
 $mutex = New-Object System.Threading.Mutex($false, $mutexName)
 if (!$mutex.WaitOne(0)) {
