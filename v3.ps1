@@ -267,8 +267,14 @@ function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) 
 
     $lastExit = 1
     for ($attempt = 1; $attempt -le $keyHuntRetries; $attempt++) {
-        $proc = Start-Process -FilePath $exe -ArgumentList $argList -NoNewWindow -Wait -PassThru
-        $lastExit = $proc.ExitCode
+        # Use & not Start-Process - paths with spaces (e.g. "Original BTC Core") must stay one argument
+        $cmdPreview = "$exe " + ($argList | ForEach-Object {
+            if ($_ -match '\s') { "`"$_`"" } else { $_ }
+        }) -join ' '
+        Info "KeyHunt: $cmdPreview"
+
+        & $exe @argList
+        $lastExit = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }
         if ($lastExit -eq 0) { return 0 }
 
         Warn "KeyHunt exit $lastExit (attempt $attempt/$keyHuntRetries)"
