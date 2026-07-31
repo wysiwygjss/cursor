@@ -176,7 +176,7 @@ function Get-SubIndexForOffset(
 ) {
     if ($offset -le 0) { return 0 }
     $total = $segEnd - $segStart + 1
-  if ($total -le 0) { return 0 }
+    if ($total -le 0) { return 0 }
     $idx = ($offset * $totalSubs) / $total
     return [int]$idx
 }
@@ -365,7 +365,7 @@ function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) 
 
     $lastExit = 1
     for ($attempt = 1; $attempt -le $keyHuntRetries; $attempt++) {
-        # Use & not Start-Process - paths with spaces (e.g. "Original BTC Core") must stay one argument
+        # Start-Process -Wait + ArgumentList keeps paths with spaces as single args
         $cmdPreview = "$exe " + ($argList | ForEach-Object {
             if ($_ -match '\s') { "`"$_`"" } else { $_ }
         }) -join ' '
@@ -432,7 +432,7 @@ function Register-AutoStartTask {
         -RestartCount 999 `
         -RestartInterval (New-TimeSpan -Minutes 1)
 
-  # Limited = no Administrator required (Highest needs elevated PowerShell)
+    # Limited = no Administrator required (Highest needs elevated PowerShell)
     $principal = New-ScheduledTaskPrincipal `
         -UserId "$env:USERDOMAIN\$env:USERNAME" `
         -LogonType Interactive `
