@@ -10,7 +10,7 @@ param(
 )
 
 $wrapperDir  = "C:\Users\Admin\Documents\KeyhuntSuite\Wrappers"
-$scanScript  = Join-Path $wrapperDir "v2.ps1"
+$scanScript  = Join-Path $wrapperDir "v3.ps1"
 $logFile     = Join-Path $wrapperDir "runner.log"
 $mutexName   = "Global\KeyHuntSegmentScanner"
 
