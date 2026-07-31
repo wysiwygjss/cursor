@@ -86,7 +86,7 @@ function Parse-ResumeLine([string]$line) {
         }
     }
 
-  $parts = $line.Split(',')
+    $parts = $line.Split(',')
     if ($parts.Count -eq 3 -and $parts[0] -match '^\d+$' -and $parts[1] -match '^\d+$') {
         return @{ SegIdx = [int]$parts[0]; SubIdx = [int]$parts[1]; StartHex = $null; EndHex = $null }
     }
@@ -113,7 +113,7 @@ function Get-ResumeState([int]$segIdx) {
 
     $state.LastSub = $p.SubIdx
     $state.NextSub = $p.SubIdx + 1
-  if ($p.SubIdx -eq $lastSub) {
+    if ($p.SubIdx -eq $lastSub) {
         $state.Complete = $true
         $state.NextSub  = $subCount
     }
