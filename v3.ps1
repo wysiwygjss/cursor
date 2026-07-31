@@ -3,13 +3,17 @@
 #
 # Run (pick ONE):
 #   Double-click Run-V3.cmd
-#   powershell -NoProfile -ExecutionPolicy Bypass -File "...\Wrappers\v3.ps1" -startIndex 7790 -saveIntervalHours 6
+#   powershell -NoProfile -ExecutionPolicy Bypass -File "...\Wrappers\v3.ps1" -startIndex 7790 -autoSubSize -hoursPerSub 2 -saveIntervalHours 2
+# Finish in-progress segment 7790 (old 53687 subs): add -subCount 53687 and omit -autoSubSize
 # Do NOT use:  & v3.ps1   (execution policy blocks unless you Bypass the current session)
 
 param(
     [int]$startIndex = -1,
     [int]$startSub   = -1,
     [int]$subCount   = 53687,
+    [switch]$autoSubSize,
+    [double]$hoursPerSub = 2,
+    [double]$keysPerSecond = 4629710000,
     [ValidateSet("compressed", "uncompressed", "both")]
     [string]$mode = "uncompressed",
     [double]$saveIntervalHours = 2,
@@ -119,6 +123,57 @@ function Get-SubRange(
     return @{ Start = $subStart; End = $subEnd }
 }
 
+function Get-ChunkKeyCount {
+    $n = [int64]($keysPerSecond * $saveIntervalHours * 3600.0)
+    if ($n -lt 1) { $n = 1 }
+    return [System.Numerics.BigInteger]$n
+}
+
+function Get-SegmentSubCount(
+    [System.Numerics.BigInteger]$segStart,
+    [System.Numerics.BigInteger]$segEnd
+) {
+    if (!$autoSubSize) { return $subCount }
+
+    $total = $segEnd - $segStart + 1
+    $keysPerSub = [System.Numerics.BigInteger]([int64]($keysPerSecond * $hoursPerSub * 3600.0))
+    if ($keysPerSub -le 0) { return $subCount }
+
+    $n = ($total + $keysPerSub - 1) / $keysPerSub
+    if ($n -lt 1) { return 1 }
+    if ($n -gt 2147483647) { return 2147483647 }
+    return [int]$n
+}
+
+function Get-RangeChunks(
+    [System.Numerics.BigInteger]$start,
+    [System.Numerics.BigInteger]$end,
+    [System.Numerics.BigInteger]$chunkSize
+) {
+    $list = New-Object System.Collections.ArrayList
+    $pos = $start
+    while ($pos -le $end) {
+        $chunkEnd = $pos + $chunkSize - 1
+        if ($chunkEnd -gt $end) { $chunkEnd = $end }
+        $list.Add(@{ Start = $pos; End = $chunkEnd }) | Out-Null
+        $pos = $chunkEnd + 1
+    }
+    return $list
+}
+
+function Get-SubIndexForOffset(
+    [System.Numerics.BigInteger]$segStart,
+    [System.Numerics.BigInteger]$segEnd,
+    [System.Numerics.BigInteger]$offset,
+    [int]$totalSubs
+) {
+    if ($offset -le 0) { return 0 }
+    $total = $segEnd - $segStart + 1
+  if ($total -le 0) { return 0 }
+    $idx = ($offset * $totalSubs) / $total
+    return [int]$idx
+}
+
 # ==================== RESUME (max completed SUB - not last line) ====================
 # 7790,776,71DB28E0E60D099E5C,71DB28E2E60D429E62,07/13/2026 05:58:33
 function Parse-ResumeLine([string]$line) {
@@ -128,7 +183,7 @@ function Parse-ResumeLine([string]$line) {
 
     if ($line -match '^(\d+),(\d+),([0-9A-Fa-f]+),([0-9A-Fa-f]+),(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})$') {
         $subIdx = [int]$Matches[2]
-        if ($subIdx -ge $subCount) { return $null }
+        if ($subIdx -ge 999999999) { return $null }
         return @{
             SegIdx    = [int]$Matches[1]
             SubIdx    = $subIdx
@@ -141,7 +196,7 @@ function Parse-ResumeLine([string]$line) {
     $parts = $line.Split(',')
     if ($parts.Count -eq 3 -and $parts[0] -match '^\d+$' -and $parts[1] -match '^\d+$') {
         $subIdx = [int]$parts[1]
-        if ($subIdx -ge $subCount) { return $null }
+        if ($subIdx -ge 999999999) { return $null }
         return @{
             SegIdx    = [int]$parts[0]
             SubIdx    = $subIdx
@@ -185,13 +240,19 @@ function Get-LastResumeEntry([string]$resumeFile, [int]$segIdx) {
     return $null
 }
 
-function Get-ResumeState([int]$segIdx) {
+function Get-ResumeState(
+    [int]$segIdx,
+    [int]$segSubCount,
+    [System.Numerics.BigInteger]$segStart,
+    [System.Numerics.BigInteger]$segEnd
+) {
     $resumeFile = Join-Path $scanDir "$segIdx-resume.txt"
-    $lastSubIdx = $subCount - 1
+    $lastSubIdx = $segSubCount - 1
     $state = @{
         Complete = $false
         NextSub  = 0
         LastSub  = -1
+        Partial  = $false
         File     = $resumeFile
         EndHex   = $null
     }
@@ -205,20 +266,53 @@ function Get-ResumeState([int]$segIdx) {
     }
 
     $state.LastSub = $maxEntry.SubIdx
-    $state.NextSub = $maxEntry.SubIdx + 1
     $state.EndHex  = $maxEntry.EndHex
 
-    if ($maxEntry.SubIdx -eq $lastSubIdx) {
+    $subComplete = $false
+    if ($maxEntry.EndHex) {
+        $subRange = Get-SubRange $segStart $segEnd $maxEntry.SubIdx $segSubCount
+        $expectedEnd = (BigToHex $subRange.End).ToUpper()
+        if ($maxEntry.EndHex.ToUpper() -eq $expectedEnd) {
+            $subComplete = $true
+            $state.NextSub = $maxEntry.SubIdx + 1
+        }
+        else {
+            $state.Partial = $true
+            $state.NextSub = $maxEntry.SubIdx
+        }
+    }
+    else {
+        $state.NextSub = $maxEntry.SubIdx + 1
+        $subComplete = $true
+    }
+
+    if ($autoSubSize -and $maxEntry.EndHex) {
+        $continueKey = HexToBig $maxEntry.EndHex + 1
+        if ($continueKey -le $segEnd) {
+            $offset = $continueKey - $segStart
+            $mappedSub = Get-SubIndexForOffset $segStart $segEnd $offset $segSubCount
+            $state.NextSub = $mappedSub
+            $state.Partial = $true
+            $state.LastSub = $mappedSub
+        }
+    }
+
+    if ($maxEntry.SubIdx -eq $lastSubIdx -and $subComplete) {
         $state.Complete = $true
-        $state.NextSub  = $subCount
+        $state.NextSub  = $segSubCount
     }
 
     return $state
 }
 
-function Find-NextOpenSegment([int]$fromIdx, [int]$toIdx) {
+function Find-NextOpenSegment([int]$fromIdx, [int]$toIdx, $segments) {
     for ($i = $fromIdx; $i -lt $toIdx; $i++) {
-        $state = Get-ResumeState $i
+        $range = Parse-SegmentRange $segments[$i]
+        if (!$range) { continue }
+        $st = HexToBig $range.Start
+        $en = HexToBig $range.End
+        $ssc = Get-SegmentSubCount $st $en
+        $state = Get-ResumeState $i $ssc $st $en
         if (!$state.Complete) {
             return @{ Found = $true; Index = $i; NextSub = $state.NextSub }
         }
@@ -445,7 +539,7 @@ function Run-Scan([bool]$explicitStartSub) {
     }
 
     $segments = @(Get-Content $segmentFile | Where-Object { $_.Trim() -and !$_.Trim().StartsWith("#") })
-    Info ("v3 | segments: {0} | floor: {1} | checkpoint: {2}h" -f $segments.Count, $floorIndex, $saveIntervalHours)
+    Info ("v3 | segments: {0} | floor: {1} | save every {2}h | sub ~{3}h" -f $segments.Count, $floorIndex, $saveIntervalHours, $(if ($autoSubSize) { $hoursPerSub } else { "fixed $subCount subs" }))
     Info "Resume: highest completed SUB per segment (stray low lines ignored)"
 
     $seg = $startIndex
@@ -453,10 +547,19 @@ function Run-Scan([bool]$explicitStartSub) {
 
     if ($seg -ge 0) {
         if (!$explicitStartSub) {
-            $state = Get-ResumeState $seg
+            $initRange = Parse-SegmentRange $segments[$seg]
+            if ($initRange) {
+                $ist = HexToBig $initRange.Start
+                $ien = HexToBig $initRange.End
+                $iss = Get-SegmentSubCount $ist $ien
+                $state = Get-ResumeState $seg $iss $ist $ien
+            }
+            else {
+                $state = @{ Complete = $false; NextSub = 0; LastSub = -1; Partial = $false }
+            }
             if ($state.Complete) {
                 Warn "SEG $seg complete - advancing"
-                $next = Find-NextOpenSegment ($seg + 1) $segments.Count
+                $next = Find-NextOpenSegment ($seg + 1) $segments.Count $segments
                 if ($next.Found) {
                     $seg = $next.Index
                     $sub = $next.NextSub
@@ -482,7 +585,7 @@ function Run-Scan([bool]$explicitStartSub) {
         }
     }
     else {
-        $next = Find-NextOpenSegment $floorIndex $segments.Count
+        $next = Find-NextOpenSegment $floorIndex $segments.Count $segments
         if ($next.Found) {
             $seg = $next.Index
             if (!$explicitStartSub) { $sub = $next.NextSub }
