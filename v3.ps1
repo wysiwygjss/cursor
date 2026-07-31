@@ -29,6 +29,11 @@ $segmentFile = "C:\Users\Admin\Documents\KeyhuntSuite\segment71_10000.txt"
 $exe         = "C:\Users\Admin\Documents\KeyhuntSuite\Bin\KeyHunt-Cuda.exe"
 $targetDir   = "C:\Users\Admin\Documents\KeyhuntSuite\bitcoincore_utxo"
 $defaultTarget = Join-Path $targetDir "hash160_sorted.bin"
+$targetCandidates = @(
+    $defaultTarget
+    "C:\Users\Admin\Documents\KeyhuntSuite\Original BTC Core\hash160_sorted.bin"
+    (Join-Path $targetDir "hash16_sorted.bin")
+)
 $scanDir     = "C:\Users\Admin\Documents\KeyhuntSuite\Scanned_Segments"
 $foundLog    = Join-Path $scanDir "Found_All.txt"
 $scannedFile = Join-Path $scanDir "Scanned_Segments.txt"
