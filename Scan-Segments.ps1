@@ -51,38 +51,50 @@ function Parse-ScanLine([string]$line) {
     $line = $line.Trim()
     if ($line -match '^SEG') { return $null }
 
-    if ($line -match '^(\d+),(\d+),([0-9A-Fa-f]+),([0-9A-Fa-f]+),(.*)$') {
+    # Required: seg,sub,startHex,endHex,MM/dd/yyyy HH:mm:ss
+    if ($line -match '^(\d+),(\d+),([0-9A-Fa-f]+),([0-9A-Fa-f]+),(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})$') {
+        $subIdx = [int]$Matches[2]
+        if ($subIdx -ge $subCount) {
+            Warn "Ignoring invalid resume line (sub $subIdx >= subCount $subCount): $line"
+            return $null
+        }
         return @{
             SegIdx    = [int]$Matches[1]
-            SubIdx    = [int]$Matches[2]
+            SubIdx    = $subIdx
             StartHex  = $Matches[3]
             EndHex    = $Matches[4]
             Timestamp = $Matches[5].Trim()
         }
     }
 
-    # Legacy: seg,sub,timestamp
+    # Legacy: seg,sub,timestamp (exactly 3 fields — never treat hex ranges as sub index)
     $parts = $line.Split(',')
-    if ($parts.Count -ge 2 -and $parts[0] -match '^\d+$' -and $parts[1] -match '^\d+$') {
+    if ($parts.Count -eq 3 -and $parts[0] -match '^\d+$' -and $parts[1] -match '^\d+$') {
+        $subIdx = [int]$parts[1]
+        if ($subIdx -ge $subCount) {
+            return $null
+        }
         return @{
             SegIdx    = [int]$parts[0]
-            SubIdx    = [int]$parts[1]
+            SubIdx    = $subIdx
             StartHex  = $null
             EndHex    = $null
-            Timestamp = if ($parts.Count -ge 3) { $parts[2].Trim() } else { $null }
+            Timestamp = $parts[2].Trim()
         }
     }
 
     return $null
 }
 
-function Get-LastScanLine([string]$filePath) {
+function Get-LastScanLine([string]$filePath, [int]$expectedSegIdx) {
     if (!(Test-Path $filePath)) { return $null }
 
     $lines = @(Get-Content $filePath -ErrorAction SilentlyContinue)
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         $parsed = Parse-ScanLine $lines[$i]
-        if ($parsed) { return $parsed }
+        if ($parsed -and $parsed.SegIdx -eq $expectedSegIdx) {
+            return $parsed
+        }
     }
 
     return $null
@@ -126,19 +138,24 @@ function Get-SubRange([System.Numerics.BigInteger]$segStart, [System.Numerics.Bi
 
 function Get-ResumeState([int]$segIdx) {
     $resumeFile = Join-Path $scanDir "$segIdx-resume.txt"
+    $lastSubIdx = $subCount - 1
     $state = @{
-        Complete = $false
-        NextSub  = 0
-        File     = $resumeFile
+        Complete   = $false
+        NextSub    = 0
+        LastSub    = -1
+        File       = $resumeFile
     }
 
-    $parsed = Get-LastScanLine $resumeFile
+    $parsed = Get-LastScanLine $resumeFile $segIdx
     if (!$parsed) {
         return $state
     }
 
+    $state.LastSub = $parsed.SubIdx
     $state.NextSub = $parsed.SubIdx + 1
-    if ($state.NextSub -ge $subCount) {
+
+    # Segment is complete ONLY when the final sub index (subCount-1) was recorded
+    if ($parsed.SubIdx -eq $lastSubIdx) {
         $state.Complete = $true
         $state.NextSub  = $subCount
     }
@@ -216,16 +233,33 @@ Info "Save interval set to $saveIntervalHours hour(s)"
 Info "Floor segment index: $floorIndex (scan continues through all segments until stopped)"
 
 # ==================== AUTO-RESUME ====================
+$explicitStartSub = $PSBoundParameters.ContainsKey('startSub') -and $startSub -ge 0
+$initialSegIdx    = -1
+$initialSubOverride = -1
+
 if ($startIndex -ge 0) {
-    if ($startSub -lt 0) {
+    $initialSegIdx = $startIndex
+
+    if ($explicitStartSub) {
+        $initialSubOverride = $startSub
+        Info "Explicit start: SEG $startIndex SUB $startSub"
+    }
+    else {
         $state = Get-ResumeState $startIndex
+        if ($state.LastSub -ge 0) {
+            Info "Resume file: SEG $startIndex last completed SUB $state.LastSub -> next SUB $state.NextSub"
+        }
+        else {
+            Info "No resume for SEG $startIndex -> starting SUB 0"
+        }
 
         if ($state.Complete) {
-            Warn "SEG $startIndex already complete -> looking for next incomplete segment"
+            Warn "SEG $startIndex has all subs complete (last sub $($subCount - 1)) -> advancing to next segment"
             $next = Find-NextIncompleteSegment ($startIndex + 1) $segments.Count
             if ($next.Found) {
                 $startIndex = $next.Index
-                $startSub   = $next.NextSub
+                $initialSegIdx = $startIndex
+                $startSub = $next.NextSub
                 Info "Continuing at SEG $startIndex SUB $startSub"
             }
             else {
@@ -238,15 +272,13 @@ if ($startIndex -ge 0) {
             Info "Resuming SEG $startIndex from SUB $startSub"
         }
     }
-    else {
-        Info "Using explicit startSub $startSub for SEG $startIndex"
-    }
 }
 else {
     $next = Find-NextIncompleteSegment $floorIndex $segments.Count
     if ($next.Found) {
         $startIndex = $next.Index
-        if ($startSub -lt 0) {
+        $initialSegIdx = $startIndex
+        if (!$explicitStartSub) {
             $startSub = $next.NextSub
         }
         Info "Auto-resume: SEG $startIndex from SUB $startSub"
@@ -293,21 +325,29 @@ for ($segIdx = $startIndex; $segIdx -lt $segments.Count; $segIdx++) {
         continue
     }
 
-    if ($segIdx -eq $startIndex) {
-        $subStart = $startSub
-    }
-    else {
-        $subStart = 0
-    }
-
     $state = Get-ResumeState $segIdx
+
     if ($state.Complete) {
-        Info "SEG $segIdx already complete, skipping"
+        Info "SEG $segIdx finished (sub $($subCount - 1) recorded), skipping to next segment"
         continue
     }
 
+    if ($segIdx -eq $initialSegIdx -and $initialSubOverride -ge 0) {
+        $subStart = $initialSubOverride
+        $initialSubOverride = -1
+        Info "Using explicit SUB $subStart for SEG $segIdx"
+    }
+    else {
+        $subStart = $state.NextSub
+        if ($state.LastSub -ge 0) {
+            Info "SEG $segIdx resuming from SUB $subStart (last completed SUB $state.LastSub)"
+        }
+    }
+
+    if ($subStart -lt 0) { $subStart = 0 }
+
     if ($subStart -ge $subCount) {
-        Info "SEG $segIdx SUB range exhausted, skipping"
+        Warn "SEG $segIdx SUB $subStart out of range (max $($subCount - 1)) — check resume file"
         continue
     }
 
