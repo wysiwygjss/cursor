@@ -271,9 +271,17 @@ function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) 
         Info "KeyHunt: $cmdPreview"
 
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        & $exe @argList
+        $oldEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            # Start-Process -Wait blocks until KeyHunt exits; ArgumentList keeps paths as single args
+            $proc = Start-Process -FilePath $exe -ArgumentList $argList -NoNewWindow -Wait -PassThru
+            $lastExit = if ($proc) { $proc.ExitCode } else { 1 }
+        }
+        finally {
+            $ErrorActionPreference = $oldEap
+        }
         $sw.Stop()
-        $lastExit = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 1 }
         Info ("KeyHunt finished in {0:N1}s exit {1}" -f $sw.Elapsed.TotalSeconds, $lastExit)
         if ($lastExit -eq 0) { return 0 }
 
