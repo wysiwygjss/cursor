@@ -22,19 +22,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# ==================== PATHS ====================
-$wrapperDir  = "C:\Users\Admin\Documents\KeyhuntSuite\Wrappers"
+# ==================== PATHS (no spaces in folder names) ====================
+$suiteRoot   = "C:\Users\Admin\Documents\KeyhuntSuite"
+$wrapperDir  = Join-Path $suiteRoot "Wrappers"
 $scriptSelf  = if ($PSCommandPath) { $PSCommandPath } else { Join-Path $wrapperDir "v3.ps1" }
-$segmentFile = "C:\Users\Admin\Documents\KeyhuntSuite\segment71_10000.txt"
-$exe         = "C:\Users\Admin\Documents\KeyhuntSuite\Bin\KeyHunt-Cuda.exe"
-$targetDir   = "C:\Users\Admin\Documents\KeyhuntSuite\bitcoincore_utxo"
+$segmentFile = Join-Path $suiteRoot "segment71_10000.txt"
+$exe         = Join-Path $suiteRoot "Bin\KeyHunt-Cuda.exe"
+$targetDir   = Join-Path $suiteRoot "Data\btc"
 $defaultTarget = Join-Path $targetDir "hash160_sorted.bin"
-$targetCandidates = @(
-    $defaultTarget
-    "C:\Users\Admin\Documents\KeyhuntSuite\Original BTC Core\hash160_sorted.bin"
-    (Join-Path $targetDir "hash16_sorted.bin")
-)
-$scanDir     = "C:\Users\Admin\Documents\KeyhuntSuite\Scanned_Segments"
+$scanDir     = Join-Path $suiteRoot "Scanned_Segments"
 $foundLog    = Join-Path $scanDir "Found_All.txt"
 $scannedFile = Join-Path $scanDir "Scanned_Segments.txt"
 $logFile     = Join-Path $wrapperDir "runner.log"
@@ -43,21 +39,20 @@ $mutexName   = "Global\KeyHuntSegmentScanner"
 function Resolve-TargetFile {
     if ($targetFile -and (Test-Path $targetFile)) { return $targetFile }
 
-    $candidates = @()
-    if ($targetFile) { $candidates += $targetFile }
-    $candidates += $targetCandidates
+    if (Test-Path $defaultTarget) { return $defaultTarget }
 
-    foreach ($path in $candidates) {
-        if ($path -and (Test-Path $path)) { return $path }
-    }
+    New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 
-    if (Test-Path $targetDir) {
-        $found = @(Get-ChildItem -Path $targetDir -Filter "*sorted*.bin" -File -ErrorAction SilentlyContinue)
-        if ($found.Count -eq 1) { return $found[0].FullName }
-        if ($found.Count -gt 1) {
-            $hash = @($found | Where-Object { $_.Name -match 'hash' })
-            if ($hash.Count -eq 1) { return $hash[0].FullName }
+    $found = @(Get-ChildItem -Path $suiteRoot -Recurse -Filter "hash160_sorted.bin" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch 'puzzle|_puzzle' })
+    if ($found.Count -ge 1) {
+        $pick = $found | Where-Object { $_.FullName -notmatch '\s' } | Select-Object -First 1
+        if (!$pick) { $pick = $found[0] }
+        if ($pick.FullName -ne $defaultTarget) {
+            Copy-Item -Path $pick.FullName -Destination $defaultTarget -Force
+            Info "Copied target to: $defaultTarget"
         }
+        return $defaultTarget
     }
 
     return $null
@@ -396,17 +391,8 @@ function Run-Scan([bool]$explicitStartSub) {
         return 1
     }
     if (!$targetFile) {
-        Write-Host "Target file not found. Expected one of:" -ForegroundColor Red
-        Write-Host "  $defaultTarget" -ForegroundColor Yellow
-        Write-Host "  $(Join-Path $targetDir 'hash16_sorted.bin')" -ForegroundColor Yellow
-        if (Test-Path $targetDir) {
-            Write-Host "Files in $targetDir :" -ForegroundColor Yellow
-            Get-ChildItem -Path $targetDir -Filter "*.bin" -File | ForEach-Object { Write-Host "  $($_.FullName)" }
-        }
-        else {
-            Write-Host "Folder missing: $targetDir" -ForegroundColor Yellow
-        }
-        Write-Host "Or pass exact path: -targetFile `"C:\path\to\your.bin`"" -ForegroundColor Cyan
+        Write-Host "Target file not found: $defaultTarget" -ForegroundColor Red
+        Write-Host "Copy hash160_sorted.bin to Data\btc\ or pass -targetFile" -ForegroundColor Yellow
         return 1
     }
     Info "Target: $targetFile"
