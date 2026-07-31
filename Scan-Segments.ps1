@@ -15,6 +15,7 @@ $exe         = "C:\Users\Admin\Documents\KeyhuntSuite\Bin\KeyHunt-Cuda.exe"
 $targetFile  = "C:\Users\Admin\Documents\KeyhuntSuite\bitcoincore_utxo\hash160_sorted.bin"
 $scanDir     = "C:\Users\Admin\Documents\KeyhuntSuite\Scanned_Segments"
 $foundLog    = Join-Path $scanDir "Found_All.txt"
+$scannedFile = Join-Path $scanDir "Scanned_Segments.txt"
 
 New-Item -ItemType Directory -Force -Path $scanDir | Out-Null
 
@@ -33,8 +34,58 @@ function HexToBig($h) {
     [System.Numerics.BigInteger]::Parse("0" + $clean, [System.Globalization.NumberStyles]::HexNumber)
 }
 
+function Format-ScanStamp {
+    Get-Date -Format "MM/dd/yyyy HH:mm:ss"
+}
+
 function BigToHex($n) {
     $n.ToString("X")
+}
+
+function Format-ScanLine([int]$segIdx, [int]$sub, [string]$startHex, [string]$endHex) {
+    "$segIdx,$sub,$startHex,$endHex,$(Format-ScanStamp)"
+}
+
+function Parse-ScanLine([string]$line) {
+    if (!$line) { return $null }
+    $line = $line.Trim()
+    if ($line -match '^SEG') { return $null }
+
+    if ($line -match '^(\d+),(\d+),([0-9A-Fa-f]+),([0-9A-Fa-f]+),(.*)$') {
+        return @{
+            SegIdx    = [int]$Matches[1]
+            SubIdx    = [int]$Matches[2]
+            StartHex  = $Matches[3]
+            EndHex    = $Matches[4]
+            Timestamp = $Matches[5].Trim()
+        }
+    }
+
+    # Legacy: seg,sub,timestamp
+    $parts = $line.Split(',')
+    if ($parts.Count -ge 2 -and $parts[0] -match '^\d+$' -and $parts[1] -match '^\d+$') {
+        return @{
+            SegIdx    = [int]$parts[0]
+            SubIdx    = [int]$parts[1]
+            StartHex  = $null
+            EndHex    = $null
+            Timestamp = if ($parts.Count -ge 3) { $parts[2].Trim() } else { $null }
+        }
+    }
+
+    return $null
+}
+
+function Get-LastScanLine([string]$filePath) {
+    if (!(Test-Path $filePath)) { return $null }
+
+    $lines = @(Get-Content $filePath -ErrorAction SilentlyContinue)
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $parsed = Parse-ScanLine $lines[$i]
+        if ($parsed) { return $parsed }
+    }
+
+    return $null
 }
 
 function Parse-SegmentRange($line) {
@@ -81,31 +132,15 @@ function Get-ResumeState([int]$segIdx) {
         File     = $resumeFile
     }
 
-    if (!(Test-Path $resumeFile)) {
+    $parsed = Get-LastScanLine $resumeFile
+    if (!$parsed) {
         return $state
     }
 
-    $lastLine = Get-Content $resumeFile -ErrorAction SilentlyContinue | Select-Object -Last 1
-    if (!$lastLine) {
-        return $state
-    }
-
-    if ($lastLine -match '^SEG.*,DONE') {
+    $state.NextSub = $parsed.SubIdx + 1
+    if ($state.NextSub -ge $subCount) {
         $state.Complete = $true
         $state.NextSub  = $subCount
-        return $state
-    }
-
-    if ($lastLine -match '^SEG') {
-        return $state
-    }
-
-    $parts = $lastLine.Split(',')
-    if ($parts.Count -ge 2) {
-        $state.NextSub = [int]$parts[1] + 1
-        if ($state.NextSub -ge $subCount) {
-            $state.Complete = $true
-        }
     }
 
     return $state
@@ -125,22 +160,10 @@ function Find-NextIncompleteSegment([int]$fromIndex, [int]$toIndex) {
     return @{ Found = $false; Index = -1; NextSub = 0 }
 }
 
-function Write-ResumeProgress([string]$resumeFile, [int]$segIdx, [int]$sub) {
-    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $resumeFile -Value "$segIdx,$sub,$stamp"
-}
-
-function Write-ResumeSegmentDone([string]$resumeFile, [int]$segIdx) {
-    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $resumeFile -Value "SEG,$segIdx,DONE,$stamp"
-}
-
-function Write-ResumeSegmentStart([string]$resumeFile, [int]$segIdx) {
-    if (Test-Path $resumeFile) {
-        return
-    }
-    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $resumeFile -Value "SEG,$segIdx,$stamp"
+function Write-ScannedRecord([string]$resumeFile, [int]$segIdx, [int]$sub, [string]$startHex, [string]$endHex) {
+    $line = Format-ScanLine $segIdx $sub $startHex $endHex
+    Add-Content -Path $resumeFile -Value $line
+    Add-Content -Path $scannedFile -Value $line
 }
 
 function Invoke-KeyHunt([string]$rangeStr, [string]$outFile) {
@@ -194,7 +217,7 @@ Info "Floor segment index: $floorIndex (scan continues through all segments unti
 
 # ==================== AUTO-RESUME ====================
 if ($startIndex -ge 0) {
-  if ($startSub -lt 0) {
+    if ($startSub -lt 0) {
         $state = Get-ResumeState $startIndex
 
         if ($state.Complete) {
@@ -288,12 +311,13 @@ for ($segIdx = $startIndex; $segIdx -lt $segments.Count; $segIdx++) {
         continue
     }
 
-    Write-ResumeSegmentStart $resumeFile $segIdx
     Info "SEG $segIdx range $($range.Start):$($range.End) | subs $subStart..$($subCount - 1)"
 
     for ($sub = $subStart; $sub -lt $subCount; $sub++) {
-        $subRange  = Get-SubRange $segStartBig $segEndBig $sub $subCount
-        $rangeStr  = "$(BigToHex $subRange.Start):$(BigToHex $subRange.End)"
+        $subRange   = Get-SubRange $segStartBig $segEndBig $sub $subCount
+        $startHex   = BigToHex $subRange.Start
+        $endHex     = BigToHex $subRange.End
+        $rangeStr   = "${startHex}:${endHex}"
         $outFile   = Join-Path $scanDir "seg${segIdx}_sub${sub}_found.txt"
 
         Info "SEG $segIdx SUB $sub / $($subCount - 1) | range $rangeStr"
@@ -317,7 +341,7 @@ for ($segIdx = $startIndex; $segIdx -lt $segments.Count; $segIdx++) {
             }
         }
 
-        Write-ResumeProgress $resumeFile $segIdx $sub
+        Write-ScannedRecord $resumeFile $segIdx $sub $startHex $endHex
 
         $elapsedHours = ((Get-Date) - $checkpointTimer).TotalHours
         if ($elapsedHours -ge $saveIntervalHours) {
@@ -326,7 +350,6 @@ for ($segIdx = $startIndex; $segIdx -lt $segments.Count; $segIdx++) {
         }
     }
 
-    Write-ResumeSegmentDone $resumeFile $segIdx
     Ok "SEG $segIdx complete — continuing to next segment"
 }
 
