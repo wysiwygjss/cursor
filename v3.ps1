@@ -343,7 +343,7 @@ function Run-Scan([bool]$explicitStartSub) {
     }
 
     $segments = @(Get-Content $segmentFile | Where-Object { $_.Trim() -and !$_.Trim().StartsWith("#") })
-    Info "v3 | segments: $($segments.Count) | floor: $floorIndex | checkpoint: ${saveIntervalHours}h"
+    Info ("v3 | segments: {0} | floor: {1} | checkpoint: {2}h" -f $segments.Count, $floorIndex, $saveIntervalHours)
     Info "Resume: highest completed SUB per segment (stray low lines ignored)"
 
     $seg = $startIndex
@@ -438,7 +438,7 @@ function Run-Scan([bool]$explicitStartSub) {
         if ($subStart -lt 0) { $subStart = 0 }
         if ($subStart -ge $subCount) { continue }
 
-        Info "SEG $segIdx $($range.Start):$($range.End) | SUB $subStart–$($subCount - 1)"
+        Info ("SEG {0} {1}:{2} | SUB {3}-{4}" -f $segIdx, $range.Start, $range.End, $subStart, ($subCount - 1))
 
         for ($s = $subStart; $s -lt $subCount; $s++) {
             $subRange = Get-SubRange $segStartBig $segEndBig $s $subCount
@@ -465,7 +465,8 @@ function Run-Scan([bool]$explicitStartSub) {
                     $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                     foreach ($hit in $hits) {
                         if ($hit.Trim()) {
-                            Add-Content -Path $foundLog -Value "[$stamp] SEG $segIdx SUB $s | $hit"
+                            $foundMsg = "[{0}] SEG {1} SUB {2} | {3}" -f $stamp, $segIdx, $s, $hit
+                            Add-Content -Path $foundLog -Value $foundMsg
                             Ok "FOUND: $hit"
                         }
                     }
@@ -496,7 +497,7 @@ if (!$mutex.WaitOne(0)) {
     exit 0
 }
 
-Log "v3 started | startIndex=$startIndex | saveInterval=${saveIntervalHours}h | mode=$mode"
+Log ("v3 started | startIndex={0} | saveInterval={1}h | mode={2}" -f $startIndex, $saveIntervalHours, $mode)
 
 $useExplicitSub = $explicitStartSub
 while ($true) {
