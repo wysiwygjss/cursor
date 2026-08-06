@@ -4,9 +4,11 @@
 
 **Use only `v3.ps1`.** That is the full production wrapper (resume, scanning, auto-restart, Task Scheduler).
 
-There is no second script to choose from in this repo. Copy `v3.ps1` to:
+There is no second script to choose from in this repo. Copy `v3.ps1`, `v3-gui.ps1`, `Run-V3-GUI.cmd`, and the `lib\` folder to:
 
-`C:\Users\Admin\Documents\KeyhuntSuite\Wrappers\v3.ps1`
+`C:\Users\Admin\Documents\KeyhuntSuite\Wrappers\`
+
+(`lib\BtcAddress.ps1` is required for the live private-key / address table.)
 
 ## Start command
 

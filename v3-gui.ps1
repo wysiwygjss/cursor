@@ -19,11 +19,16 @@ $v3Script    = Join-Path $wrapperDir "v3.ps1"
 $segmentFile = Join-Path $suiteRoot "segment71_10000.txt"
 $scanDir     = Join-Path $suiteRoot "Scanned_Segments"
 $foundLog    = Join-Path $scanDir "Found_All.txt"
+$liveFeedFile = Join-Path $scanDir "live_feed.jsonl"
+$statusFile  = Join-Path $scanDir "status.json"
 $logFile     = Join-Path $wrapperDir "runner.log"
 $mutexName   = "Global\KeyHuntSegmentScanner"
 
 $script:ScanProcess = $null
 $script:LastLogOffset = 0L
+$script:LastLiveFeedOffset = 0L
+$script:LiveRowNum = 0
+$script:LiveRows = New-Object System.Collections.ObjectModel.ObservableCollection[object]
 $script:SpeedSamples = [System.Collections.Generic.Queue[double]]::new()
 $script:KeysGenerated = [System.Numerics.BigInteger]::Zero
 
@@ -226,6 +231,18 @@ function Update-Metrics {
         $speed = ($script:SpeedSamples | Measure-Object -Average).Average
     }
 
+    if (Test-Path $statusFile) {
+        try {
+            $st = Get-Content $statusFile -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($st.speed -and [double]$st.speed -gt 0) {
+                $speed = [double]$st.speed
+                $script:SpeedSamples.Enqueue($speed)
+                while ($script:SpeedSamples.Count -gt 8) { [void]$script:SpeedSamples.Dequeue() }
+            }
+        }
+        catch { }
+    }
+
     $lblGenerated.Text = Format-Big $script:KeysGenerated
     $lblSpeed.Text = Format-Rate $speed
     $lblWorkers.Text = "1 CUDA"
@@ -251,7 +268,59 @@ function Update-Metrics {
     else { $lblEta.Text = "—" }
 
     Update-LogTail
-    Update-FoundTable
+}
+
+function Update-LiveTable {
+    if (!(Test-Path $liveFeedFile)) { return }
+    try {
+        $fs = [System.IO.File]::Open($liveFeedFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $len = $fs.Length
+        if ($len -lt $script:LastLiveFeedOffset) {
+            $script:LastLiveFeedOffset = 0
+            $script:LiveRows.Clear()
+            $script:LiveRowNum = 0
+        }
+        $read = $len - $script:LastLiveFeedOffset
+        if ($read -le 0) { $fs.Dispose(); return }
+        $fs.Seek($script:LastLiveFeedOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+        $buf = New-Object byte[] $read
+        [void]$fs.Read($buf, 0, $read)
+        $script:LastLiveFeedOffset = $len
+        $fs.Dispose()
+        $text = [System.Text.Encoding]::UTF8.GetString($buf)
+        foreach ($line in ($text -split "`n")) {
+            $line = $line.Trim()
+            if (!$line) { continue }
+            try {
+                $o = $line | ConvertFrom-Json
+                $script:LiveRowNum++
+                $matchText = if ($o.match) { "YES" } else { "" }
+                $row = [pscustomobject]@{
+                    Num       = $script:LiveRowNum
+                    PrivKey   = [string]$o.priv
+                    Address   = [string]$o.address
+                    Balance   = if ($o.balance) { [string]$o.balance } else { "-" }
+                    Received  = if ($o.received) { [string]$o.received } else { "-" }
+                    Match     = $matchText
+                    IsMatch   = [bool]$o.match
+                }
+                $script:LiveRows.Add($row)
+                while ($script:LiveRows.Count -gt 200) { $script:LiveRows.RemoveAt(0) }
+            }
+            catch { }
+        }
+        if ($dgLive.ItemsSource -ne $script:LiveRows) {
+            $dgLive.ItemsSource = $script:LiveRows
+        }
+        if ($script:LiveRows.Count -gt 0) {
+            $dgLive.ScrollIntoView($script:LiveRows[$script:LiveRows.Count - 1])
+        }
+    }
+    catch { }
+}
+
+function Update-FoundTable {
+    # Match count comes from Found_All.txt in Update-Metrics
 }
 
 function Update-LogTail {
@@ -278,27 +347,16 @@ function Update-LogTail {
     catch { }
 }
 
-function Update-FoundTable {
-    if (!(Test-Path $foundLog)) { return }
-    $lines = @(Get-Content $foundLog -Tail 100 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() })
-    if ($lines.Count -eq $dgFound.Items.Count) { return }
-    $rows = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-    $i = 1
-    foreach ($line in $lines) {
-        $rows.Add([pscustomobject]@{
-            Num = $i++
-            Hit = $line
-        }) | Out-Null
-    }
-    $dgFound.ItemsSource = $rows
-}
-
 function Start-Scanner {
     if (!(Test-Path $v3Script)) {
         [System.Windows.MessageBox]::Show("v3.ps1 not found:`n$v3Script", "KeyHunt v3", 'OK', 'Error') | Out-Null
         return
     }
     if (Get-ScannerRunning) { return }
+
+    $script:LastLiveFeedOffset = 0L
+    $script:LiveRows.Clear()
+    $script:LiveRowNum = 0
 
     $args = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
@@ -337,7 +395,7 @@ function Stop-Scanner {
 $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="KeyHunt Segment Scanner v3" Height="820" Width="1180"
+        Title="KeyHunt Segment Scanner v3" Height="860" Width="1180"
         Background="#FFF3F4F6" FontFamily="Segoe UI" FontSize="13">
   <Grid Margin="14">
     <Grid.RowDefinitions>
@@ -345,8 +403,9 @@ $xaml = @"
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
-      <RowDefinition Height="180"/>
+      <RowDefinition Height="160"/>
     </Grid.RowDefinitions>
 
     <Border Grid.Row="0" Background="White" CornerRadius="8" Padding="12" Margin="0,0,0,10">
@@ -436,27 +495,49 @@ $xaml = @"
         <StackPanel>
           <TextBlock Text="Engine" Foreground="#666" FontSize="11"/>
           <TextBlock Text="KeyHunt CUDA" FontSize="16" FontWeight="SemiBold" Foreground="#2563EB"/>
-          <TextBlock Text="GUI monitor only" FontSize="10" Foreground="#666"/>
+          <TextBlock Text="GUI monitor + live key feed" FontSize="10" Foreground="#666"/>
         </StackPanel>
       </Border>
     </UniformGrid>
 
-    <Border Grid.Row="3" Background="#DBEAFE" CornerRadius="8" Padding="12" Margin="0,0,0,10">
+    <Border Grid.Row="3" Background="#DBEAFE" CornerRadius="8" Padding="12" Margin="0,0,0,6">
       <StackPanel>
         <TextBlock Text="Segment hunt — Puzzle #71" FontSize="16" FontWeight="Bold" Foreground="#1E3A8A"/>
-        <TextBlock Text="v3.ps1 walks segment71_10000.txt, saves resume every saveIntervalHours. The GUI does not scan keys; it only displays progress from resume files." TextWrapping="Wrap" Foreground="#1E40AF" Margin="0,4,0,0"/>
+        <TextBlock Text="Live table: sampled keys from KeyHunt [T:] progress (not every key — CUDA scans billions/s). Matches highlighted." TextWrapping="Wrap" Foreground="#1E40AF" Margin="0,4,0,0"/>
       </StackPanel>
     </Border>
 
-    <DataGrid x:Name="dgFound" Grid.Row="4" AutoGenerateColumns="False" IsReadOnly="True"
-              Background="White" Margin="0,0,0,10" HeadersVisibility="Column" GridLinesVisibility="Horizontal">
+    <Border Grid.Row="4" Background="#E5E7EB" CornerRadius="6" Padding="8,6" Margin="0,0,0,6">
+      <TextBlock Text="Security tip: disconnect from the internet for maximum security when handling private keys." Foreground="#374151" FontSize="11"/>
+    </Border>
+
+    <DataGrid x:Name="dgLive" Grid.Row="5" AutoGenerateColumns="False" IsReadOnly="True"
+              Background="White" Margin="0,0,0,10" HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+              FontFamily="Consolas" FontSize="11" RowHeight="22">
       <DataGrid.Columns>
-        <DataGridTextColumn Header="#" Binding="{Binding Num}" Width="50"/>
-        <DataGridTextColumn Header="Found entry" Binding="{Binding Hit}" Width="*"/>
+        <DataGridTextColumn Header="#" Binding="{Binding Num}" Width="45"/>
+        <DataGridTextColumn Header="Private Key" Binding="{Binding PrivKey}" Width="2*"/>
+        <DataGridTextColumn Header="Address" Binding="{Binding Address}" Width="*"/>
+        <DataGridTextColumn Header="Balance" Binding="{Binding Balance}" Width="70"/>
+        <DataGridTextColumn Header="Received" Binding="{Binding Received}" Width="70"/>
+        <DataGridTextColumn Header="Match" Binding="{Binding Match}" Width="55"/>
       </DataGrid.Columns>
+      <DataGrid.RowStyle>
+        <Style TargetType="DataGridRow">
+          <Style.Triggers>
+            <DataTrigger Binding="{Binding IsMatch}" Value="True">
+              <Setter Property="Foreground" Value="#CA8A04"/>
+              <Setter Property="FontWeight" Value="Bold"/>
+            </DataTrigger>
+            <DataTrigger Binding="{Binding IsMatch}" Value="False">
+              <Setter Property="Foreground" Value="#DC2626"/>
+            </DataTrigger>
+          </Style.Triggers>
+        </Style>
+      </DataGrid.RowStyle>
     </DataGrid>
 
-    <Border Grid.Row="5" Background="White" CornerRadius="8" Padding="8">
+    <Border Grid.Row="6" Background="White" CornerRadius="8" Padding="8">
       <DockPanel>
         <TextBlock DockPanel.Dock="Top" Text="runner.log (tail)" FontWeight="SemiBold" Margin="4,0,0,4"/>
         <TextBox x:Name="txtLog" IsReadOnly="True" FontFamily="Consolas" FontSize="11"
@@ -489,7 +570,7 @@ $lblSpeed = $window.FindName('lblSpeed')
 $lblWorkers = $window.FindName('lblWorkers')
 $lblMatch = $window.FindName('lblMatch')
 $lblEta = $window.FindName('lblEta')
-$dgFound = $window.FindName('dgFound')
+$dgLive = $window.FindName('dgLive')
 $txtLog = $window.FindName('txtLog')
 
 $btnStart.Add_Click({ Start-Scanner })
@@ -508,7 +589,12 @@ $timer.Interval = [TimeSpan]::FromSeconds(2)
 $timer.Add_Tick({ Update-Metrics })
 $timer.Start()
 
-$window.Add_Closed({ Stop-Scanner; $timer.Stop() })
+$liveTimer = New-Object System.Windows.Threading.DispatcherTimer
+$liveTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$liveTimer.Add_Tick({ Update-LiveTable })
+$liveTimer.Start()
+
+$window.Add_Closed({ Stop-Scanner; $timer.Stop(); $liveTimer.Stop() })
 
 if ($txtLog -is [System.Windows.Controls.TextBox]) {
     # RichText not needed; plain append is fine
