@@ -24,7 +24,10 @@ param(
     [switch]$RegisterAutoStart,
     [switch]$UnregisterAutoStart,
     [string]$taskName = "KeyHunt Segment Scanner",
-    [string]$targetFile = ""
+    [string]$targetFile = "",
+    [switch]$DisableLiveFeed,
+    [int]$liveFeedIntervalMs = 500,
+    [int]$liveFeedMaxRows = 200
 )
 
 # -saveIntervalHours 6 => ~6h subs + resume save every ~6h (unless -subCount 53687 for old tiny subs)
@@ -47,7 +50,27 @@ $scanDir     = Join-Path $suiteRoot "Scanned_Segments"
 $foundLog    = Join-Path $scanDir "Found_All.txt"
 $scannedFile = Join-Path $scanDir "Scanned_Segments.txt"
 $logFile     = Join-Path $wrapperDir "runner.log"
+$liveFeedFile = Join-Path $scanDir "live_feed.jsonl"
+$statusFile  = Join-Path $scanDir "status.json"
 $mutexName   = "Global\KeyHuntSegmentScanner"
+$liveFeedEnabled = -not $DisableLiveFeed.IsPresent
+
+$btcLib = Join-Path $wrapperDir "lib\BtcAddress.ps1"
+if (!(Test-Path $btcLib) -and $PSCommandPath) {
+    $btcLib = Join-Path (Split-Path $PSCommandPath -Parent) "lib\BtcAddress.ps1"
+}
+if ($liveFeedEnabled -and (Test-Path $btcLib)) {
+    . $btcLib
+}
+elseif ($liveFeedEnabled) {
+    Write-Warning "Live feed enabled but BtcAddress.ps1 not found at $btcLib — feed disabled."
+    $liveFeedEnabled = $false
+}
+
+$script:LiveFeedSeq = 0
+$script:LiveFeedLastWrite = [datetime]::MinValue
+$script:LiveFeedPendingFound = $null
+$script:LiveFeedUseCompressed = $false
 
 function Resolve-TargetFile {
     if ($targetFile -and (Test-Path $targetFile)) { return $targetFile }
@@ -350,8 +373,161 @@ function Save-Resume(
     Add-Content -Path $scannedFile -Value $line
 }
 
+# ==================== LIVE FEED (GUI table: privkey + address) ====================
+function Get-AddressCompressionFlag {
+    switch ($mode) {
+        "compressed"   { return $true }
+        "uncompressed" { return $false }
+        "both"         { return $true }
+        default        { return $false }
+    }
+}
+
+function Write-ScanStatus {
+    param(
+        [hashtable]$Fields
+    )
+    if (!$liveFeedEnabled) { return }
+    try {
+        $obj = @{
+            updated = (Get-Date).ToString("o")
+        }
+        foreach ($k in $Fields.Keys) { $obj[$k] = $Fields[$k] }
+        $json = $obj | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($statusFile, $json, [System.Text.UTF8Encoding]::new($false))
+    }
+    catch { }
+}
+
+function Add-LiveFeedRow {
+    param(
+        [string]$PrivHex,
+        [string]$Address,
+        [bool]$Match = $false,
+        [string]$Balance = "-",
+        [string]$Received = "-",
+        [double]$Speed = 0,
+        [int]$SegIdx = -1,
+        [int]$SubIdx = -1,
+        [switch]$Force
+    )
+    if (!$liveFeedEnabled) { return }
+    if (!$Force) {
+        $elapsed = ((Get-Date) - $script:LiveFeedLastWrite).TotalMilliseconds
+        if ($elapsed -lt $liveFeedIntervalMs) { return }
+    }
+
+    $privHex = ($PrivHex -replace '\s', '').Trim().ToUpper()
+    if ($privHex -match '^0X') { $privHex = $privHex.Substring(2) }
+    if (!$privHex) { return }
+
+    if (!$Address) {
+        $Address = Get-BtcAddressFromPrivHex -PrivHex $privHex -Compressed $script:LiveFeedUseCompressed
+    }
+
+    $script:LiveFeedSeq++
+    $row = [ordered]@{
+        n        = $script:LiveFeedSeq
+        priv     = $privHex
+        address  = $Address
+        balance  = $Balance
+        received = $Received
+        match    = $Match
+        speed    = $Speed
+        seg      = $SegIdx
+        sub      = $SubIdx
+        ts       = (Get-Date).ToString("o")
+    }
+    $line = ($row | ConvertTo-Json -Compress)
+    Add-Content -Path $liveFeedFile -Value $line -Encoding UTF8
+
+    $lines = @(Get-Content $liveFeedFile -ErrorAction SilentlyContinue)
+    if ($lines.Count -gt $liveFeedMaxRows) {
+        $trim = $lines | Select-Object -Last $liveFeedMaxRows
+        [System.IO.File]::WriteAllLines($liveFeedFile, $trim, [System.Text.UTF8Encoding]::new($false))
+    }
+
+    $script:LiveFeedLastWrite = Get-Date
+    Write-ScanStatus @{
+        privHex    = $privHex
+        address    = $Address
+        speed      = $Speed
+        segIdx     = $SegIdx
+        subIdx     = $SubIdx
+        matchCount = $(if ($Match) { 1 } else { 0 })
+    }
+}
+
+function Clear-LiveFeed {
+    if (!$liveFeedEnabled) { return }
+    if (Test-Path $liveFeedFile) { Remove-Item $liveFeedFile -Force -ErrorAction SilentlyContinue }
+    $script:LiveFeedSeq = 0
+    $script:LiveFeedLastWrite = [datetime]::MinValue
+}
+
+function Invoke-KeyHuntLineParser {
+    param(
+        [string]$Line,
+        [System.Numerics.BigInteger]$ChunkStart,
+        [int]$SegIdx,
+        [int]$SubIdx
+    )
+    if (!$Line) { return }
+
+    if ($Line -match 'PubAddress:\s*(\S+)') {
+        if (!$script:LiveFeedPendingFound) { $script:LiveFeedPendingFound = @{} }
+        $script:LiveFeedPendingFound.address = $Matches[1]
+    }
+    if ($Line -match 'Priv \(HEX\):\s*(0x)?([0-9A-Fa-f]+)') {
+        if (!$script:LiveFeedPendingFound) { $script:LiveFeedPendingFound = @{} }
+        $script:LiveFeedPendingFound.priv = $Matches[2].ToUpper()
+    }
+    if ($script:LiveFeedPendingFound -and $script:LiveFeedPendingFound.priv -and $script:LiveFeedPendingFound.address) {
+        Add-LiveFeedRow -PrivHex $script:LiveFeedPendingFound.priv `
+            -Address $script:LiveFeedPendingFound.address -Match $true -Force `
+            -SegIdx $SegIdx -SubIdx $SubIdx
+        $script:LiveFeedPendingFound = $null
+    }
+
+    $speed = 0.0
+    if ($Line -match '\[CPU\+GPU:\s*([0-9,\.]+)\s*([kKmMgG]?)/s\]') {
+        $speed = [double]($Matches[1] -replace ',', '')
+        $unit = $Matches[2].ToUpper()
+        switch ($unit) {
+            'G' { $speed *= 1e9 }
+            'M' { $speed *= 1e6 }
+            'K' { $speed *= 1e3 }
+        }
+    }
+    elseif ($Line -match '\[GPU:\s*([0-9,\.]+)\s*([kKmMgG]?)/s\]') {
+        $speed = [double]($Matches[1] -replace ',', '')
+        $unit = $Matches[2].ToUpper()
+        switch ($unit) {
+            'G' { $speed *= 1e9 }
+            'M' { $speed *= 1e6 }
+            'K' { $speed *= 1e3 }
+        }
+    }
+
+    if ($Line -match '\[T:\s*([0-9,]+)') {
+        $tested = [System.Numerics.BigInteger]::Parse(($Matches[1] -replace ',', ''))
+        if ($tested -gt 0) {
+            $current = $ChunkStart + $tested - 1
+            $privHex = BigToHex $current
+            Add-LiveFeedRow -PrivHex $privHex -Speed $speed -SegIdx $SegIdx -SubIdx $SubIdx
+        }
+    }
+}
+
 # ==================== KEYHUNT ====================
-function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) {
+function Invoke-KeyHunt(
+    [string]$rangeStr,
+    [string]$outFile,
+    [string]$modeFlag,
+    [System.Numerics.BigInteger]$chunkStart,
+    [int]$segIdx,
+    [int]$subIdx
+) {
     $argList = @(
         "-t", "0",
         "-g",
@@ -363,9 +539,11 @@ function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) 
     )
     if ($modeFlag) { $argList += $modeFlag }
 
+    $script:LiveFeedUseCompressed = Get-AddressCompressionFlag
+    $script:LiveFeedPendingFound = $null
+
     $lastExit = 1
     for ($attempt = 1; $attempt -le $keyHuntRetries; $attempt++) {
-        # Use & not Start-Process - paths with spaces (e.g. "Original BTC Core") must stay one argument
         $cmdPreview = "$exe " + ($argList | ForEach-Object {
             if ($_ -match '\s') { "`"$_`"" } else { $_ }
         }) -join ' '
@@ -375,9 +553,46 @@ function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) 
         $oldEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            # Start-Process -Wait blocks until KeyHunt exits; ArgumentList keeps paths as single args
-            $proc = Start-Process -FilePath $exe -ArgumentList $argList -NoNewWindow -Wait -PassThru
-            $lastExit = if ($proc) { $proc.ExitCode } else { 1 }
+            if ($liveFeedEnabled) {
+                $psi = New-Object System.Diagnostics.ProcessStartInfo
+                $psi.FileName = $exe
+                $psi.Arguments = ($argList | ForEach-Object {
+                    if ($_ -match '\s') { "`"$_`"" } else { $_ }
+                }) -join ' '
+                $psi.UseShellExecute = $false
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                $psi.CreateNoWindow = $true
+                $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+                $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+                $script:ParserChunkStart = $chunkStart
+                $script:ParserSegIdx = $segIdx
+                $script:ParserSubIdx = $subIdx
+
+                $proc = New-Object System.Diagnostics.Process
+                $proc.StartInfo = $psi
+                $handler = {
+                    param($sender, $e)
+                    if ($e.Data) {
+                        Invoke-KeyHuntLineParser -Line $e.Data `
+                            -ChunkStart $script:ParserChunkStart `
+                            -SegIdx $script:ParserSegIdx `
+                            -SubIdx $script:ParserSubIdx
+                    }
+                }
+                $proc.add_OutputDataReceived($handler)
+                $proc.add_ErrorDataReceived($handler)
+                [void]$proc.Start()
+                $proc.BeginOutputReadLine()
+                $proc.BeginErrorReadLine()
+                $proc.WaitForExit()
+                $lastExit = $proc.ExitCode
+            }
+            else {
+                $proc = Start-Process -FilePath $exe -ArgumentList $argList -NoNewWindow -Wait -PassThru
+                $lastExit = if ($proc) { $proc.ExitCode } else { 1 }
+            }
         }
         finally {
             $ErrorActionPreference = $oldEap
@@ -523,6 +738,7 @@ if ($RegisterAutoStart) {
 # ==================== SCAN ====================
 function Run-Scan([bool]$explicitStartSub) {
     New-Item -ItemType Directory -Force -Path $scanDir | Out-Null
+    if ($liveFeedEnabled) { Clear-LiveFeed }
 
     $floorIndex = if ($startIndex -ge 0) { $startIndex } else { 0 }
 
@@ -681,7 +897,7 @@ function Run-Scan([bool]$explicitStartSub) {
 
                 Info ("SEG $segIdx SUB $s/$($segSubCount - 1) chunk $rangeStr")
 
-                $exitCode = Invoke-KeyHunt $rangeStr $outFile $modeFlag
+                $exitCode = Invoke-KeyHunt $rangeStr $outFile $modeFlag $chunk.Start $segIdx $s
                 if ($exitCode -ne 0) {
                     Warn "KeyHunt failed SEG $segIdx SUB $s"
                     return $exitCode
