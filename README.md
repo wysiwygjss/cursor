@@ -25,3 +25,31 @@ Resume line format:
 ```
 
 Max SUB 776 → next run starts at SUB 777.
+
+## GUI dashboard (`v3-gui.ps1`)
+
+A WPF monitor modeled after browser key-hunt dashboards. It **does not** scan keys itself.
+
+```text
+Double-click Run-V3-GUI.cmd
+```
+
+Or:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -STA -File "C:\Users\Admin\Documents\KeyhuntSuite\Wrappers\v3-gui.ps1"
+```
+
+Copy `v3-gui.ps1` and `Run-V3-GUI.cmd` next to `v3.ps1` under `Wrappers\`.
+
+### Speed impact
+
+| Layer | Role | Typical impact on keys/sec |
+|-------|------|----------------------------|
+| `KeyHunt-Cuda.exe` | GPU scan | 100% of throughput |
+| `v3.ps1` | Launches CUDA, writes resume | &lt; 0.1% (blocked on GPU) |
+| `v3-gui.ps1` | Polls resume/log every 2s | **~0%** |
+
+The sample screenshot uses **browser WASM workers** (~10⁵–10⁶ keys/s). Your wrapper uses **CUDA** (~10⁹+ keys/s). A monitor GUI adds no meaningful GPU load as long as it only reads files and does not run KeyHunt in-process.
+
+Real-time speed in the GUI is estimated from resume timestamps (updates every `saveIntervalHours` chunk by default). For smoother speed/ETA, add a small `status.json` write inside `v3.ps1` after each chunk (optional enhancement).
