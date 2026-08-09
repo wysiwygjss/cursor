@@ -28,7 +28,6 @@ param(
     [string]$taskName = "KeyHunt Segment Scanner",
     [string]$targetFile = "",
     [string]$suiteRoot = "",
-    [long]$minFreeSpaceMB = 100,
     [int]$maxConsecutiveErrors = 5
 )
 
@@ -285,24 +284,6 @@ function Initialize-Directory([string]$path) {
         catch {
             throw "Failed to create directory: $path - $($_.Exception.Message)"
         }
-    }
-}
-
-function Test-DiskSpace([string]$path, [long]$requiredMB) {
-    $root = [System.IO.Path]::GetPathRoot($path)
-    if ([string]::IsNullOrWhiteSpace($root)) {
-        Warn "Could not determine drive for disk space check: $path"
-        return
-    }
-    $drive = $root.TrimEnd('\')
-    $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction SilentlyContinue
-    if (!$disk) {
-        Warn "Could not query free disk space for $drive - continuing anyway"
-        return
-    }
-    $freeMB = [math]::Floor($disk.FreeSpace / 1MB)
-    if ($freeMB -lt $requiredMB) {
-        throw "Insufficient disk space on ${drive}. Required: ${requiredMB}MB, Available: ${freeMB}MB"
     }
 }
 
@@ -678,7 +659,6 @@ function Register-AutoStartTask {
     if ($suiteRoot -ne "C:\Users\Admin\Documents\KeyhuntSuite") {
         $argString += " -suiteRoot `"$suiteRoot`""
     }
-    if ($minFreeSpaceMB -ne 100) { $argString += " -minFreeSpaceMB $minFreeSpaceMB" }
     if ($maxConsecutiveErrors -ne 5) { $argString += " -maxConsecutiveErrors $maxConsecutiveErrors" }
     if ($keyHuntRetries -ne 5) { $argString += " -keyHuntRetries $keyHuntRetries" }
     if ($keyHuntRetryDelaySeconds -ne 60) { $argString += " -keyHuntRetryDelaySeconds $keyHuntRetryDelaySeconds" }
@@ -770,7 +750,6 @@ function Unregister-AutoStartTask {
 # ==================== MAIN SCAN ====================
 function Run-Scan([bool]$explicitStartSub) {
     Initialize-Directory $scanDir
-    Test-DiskSpace $scanDir $minFreeSpaceMB
 
     $floorIndex = if ($startIndex -ge 0) { $startIndex } else { 0 }
 
