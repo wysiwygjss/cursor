@@ -1,5 +1,14 @@
-# KeyHunt Segment Scanner v3.1 - Corrected
+# KeyHunt Segment Scanner v3.4 - Production Grade
+# Requires: PowerShell 5.1+ or PowerShell Core 7.x
 # Save as: C:\Users\Admin\Documents\KeyhuntSuite\Wrappers\v3.ps1
+#
+# EXIT CODES:
+#   0 = Success (all segments complete)
+#   1 = Error (initialization failed, runtime error after retries, invalid parameters)
+#   2 = Already running (mutex conflict - not an error, just skip)
+#
+# Run:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File "v3.ps1" -startIndex 7790 -saveIntervalHours 6 -RegisterAutoStart
 
 param(
     [int]$startIndex = -1,
@@ -19,14 +28,35 @@ param(
     [string]$taskName = "KeyHunt Segment Scanner",
     [string]$targetFile = "",
     [string]$suiteRoot = "",
-    [long]$minFreeSpaceMB = 100
+    [long]$minFreeSpaceMB = 100,
+    [int]$maxConsecutiveErrors = 5
 )
 
+$global:ScriptExitCode = 0
+
+# ==================== VALIDATION ====================
 if ($PSBoundParameters.ContainsKey("startSub") -and $startSub -ge 0 -and $startIndex -lt 0) {
-    throw "-startSub requires -startIndex (e.g. -startIndex 7790 -startSub 776)"
+    Write-Error "-startSub requires -startIndex (e.g. -startIndex 7790 -startSub 776)"
+    exit 1
 }
 
-# Calculate hoursPerSub from saveIntervalHours if not specified
+if ($saveIntervalHours -le 0) {
+    Write-Error "saveIntervalHours must be greater than 0"
+    exit 1
+}
+if ($keysPerSecond -le 0) {
+    Write-Error "keysPerSecond must be greater than 0"
+    exit 1
+}
+if ($restartDelaySeconds -lt 0) {
+    Write-Error "restartDelaySeconds cannot be negative"
+    exit 1
+}
+if ($maxConsecutiveErrors -lt 1) {
+    Write-Error "maxConsecutiveErrors must be at least 1"
+    exit 1
+}
+
 if ($hoursPerSub -le 0) { $hoursPerSub = $saveIntervalHours }
 if ($PSBoundParameters.ContainsKey('saveIntervalHours') -and !$PSBoundParameters.ContainsKey('subCount')) {
     $autoSubSize = $true
@@ -34,7 +64,7 @@ if ($PSBoundParameters.ContainsKey('saveIntervalHours') -and !$PSBoundParameters
 
 $ErrorActionPreference = "Stop"
 
-# ==================== PATHS (VALIDATED) ====================
+# ==================== PATHS ====================
 if ([string]::IsNullOrWhiteSpace($suiteRoot)) {
     $suiteRoot = $env:KEYHUNT_SUITE_ROOT
 }
@@ -43,79 +73,23 @@ if ([string]::IsNullOrWhiteSpace($suiteRoot)) {
 }
 
 if ($suiteRoot -match '\s') {
-    throw "suiteRoot path cannot contain spaces: $suiteRoot"
+    Write-Error "suiteRoot path cannot contain spaces: $suiteRoot"
+    exit 1
 }
 
-$wrapperDir  = Join-Path $suiteRoot "Wrappers"
-$scriptSelf  = if ($PSCommandPath) { $PSCommandPath } else { Join-Path $wrapperDir "v3.ps1" }
-$segmentFile = Join-Path $suiteRoot "segment71_10000.txt"
-$exe         = Join-Path $suiteRoot "Bin\KeyHunt-Cuda.exe"
-$targetDir   = Join-Path $suiteRoot "Data\btc"
+$wrapperDir    = Join-Path $suiteRoot "Wrappers"
+$scriptSelf    = if ($PSCommandPath) { $PSCommandPath } else { Join-Path $wrapperDir "v3.ps1" }
+$segmentFile   = Join-Path $suiteRoot "segment71_10000.txt"
+$exe           = Join-Path $suiteRoot "Bin\KeyHunt-Cuda.exe"
+$targetDir     = Join-Path $suiteRoot "Data\btc"
 $defaultTarget = Join-Path $targetDir "hash160_sorted.bin"
-$scanDir     = Join-Path $suiteRoot "Scanned_Segments"
-$foundLog    = Join-Path $scanDir "Found_All.txt"
-$scannedFile = Join-Path $scanDir "Scanned_Segments.txt"
-$logFile     = Join-Path $wrapperDir "runner.log"
-$mutexName   = "Global\KeyHuntSegmentScanner"
+$scanDir       = Join-Path $suiteRoot "Scanned_Segments"
+$foundLog      = Join-Path $scanDir "Found_All.txt"
+$scannedFile   = Join-Path $scanDir "Scanned_Segments.txt"
+$logFile       = Join-Path $wrapperDir "runner.log"
+$mutexName     = "Global\KeyHuntSegmentScanner"
 
-function Initialize-Directory([string]$path) {
-    if (!(Test-Path $path)) {
-        try {
-            New-Item -ItemType Directory -Force -Path $path | Out-Null
-        }
-        catch {
-            throw "Failed to create directory: $path - $($_.Exception.Message)"
-        }
-    }
-}
-
-function Test-DiskSpace([string]$path, [long]$requiredMB) {
-    $root = [System.IO.Path]::GetPathRoot($path)
-    if ([string]::IsNullOrWhiteSpace($root)) { return }
-    $drive = $root.TrimEnd('\')
-    $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction SilentlyContinue
-    if ($disk) {
-        $freeMB = [math]::Floor($disk.FreeSpace / 1MB)
-        if ($freeMB -lt $requiredMB) {
-            throw "Insufficient disk space on ${drive}. Required: ${requiredMB}MB, Available: ${freeMB}MB"
-        }
-    }
-}
-
-function Resolve-TargetFile {
-    if ($targetFile -and (Test-Path $targetFile)) {
-        if ($targetFile -match '\s') {
-            throw "Target file path cannot contain spaces: $targetFile"
-        }
-        return $targetFile
-    }
-
-    if (Test-Path $defaultTarget) { return $defaultTarget }
-
-    Initialize-Directory $targetDir
-
-    $found = @(Get-ChildItem -Path $suiteRoot -Recurse -Filter "hash160_sorted.bin" -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch 'puzzle|_puzzle' })
-
-    if ($found.Count -ge 1) {
-        $pick = $found | Where-Object { $_.FullName -notmatch '\s' } | Select-Object -First 1
-        if (!$pick) {
-            throw "Found target file(s) but all contain spaces in path. KeyHunt requires paths without spaces."
-        }
-        if ($pick.FullName -ne $defaultTarget) {
-            Copy-Item -Path $pick.FullName -Destination $defaultTarget -Force
-            Write-Host "Copied target to: $defaultTarget" -ForegroundColor Cyan
-        }
-        return $defaultTarget
-    }
-
-    return $null
-}
-
-$targetFile = Resolve-TargetFile
-Initialize-Directory $wrapperDir
-
-# ==================== LOGGING (with rotation) ====================
+# ==================== LOGGING ====================
 function Log($m) {
     $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $m"
     try {
@@ -135,8 +109,73 @@ function Now { Get-Date -Format "HH:mm:ss" }
 function Info($m) { Write-Host "[$(Now)] $m" -ForegroundColor Cyan }
 function Warn($m) { Write-Host "[$(Now)] $m" -ForegroundColor Yellow }
 function Ok($m)   { Write-Host "[$(Now)] $m" -ForegroundColor Green }
+function Err($m)  { Write-Host "[$(Now)] $m" -ForegroundColor Red }
 
-# ==================== HEX / RANGE (VALIDATED) ====================
+# ==================== ARITHMETIC (OVERFLOW-SAFE) ====================
+function Test-BigIntegerOps {
+    try {
+        $a = [System.Numerics.BigInteger]::Parse("10000000000000000000")
+        $b = [System.Numerics.BigInteger]::Parse("3")
+        $c = [System.Numerics.BigInteger]::op_Division($a, $b)
+        $d = [System.Numerics.BigInteger]::Parse("100")
+        $e = [System.Numerics.BigInteger]::op_Division($d, [System.Numerics.BigInteger]::Parse("3"))
+
+        if ($c.ToString() -ne "3333333333333333333" -or $e.ToString() -ne "33") {
+            throw "BigInteger division test failed"
+        }
+        return $true
+    }
+    catch {
+        Err "BigInteger arithmetic test failed: $_"
+        return $false
+    }
+}
+
+if (!(Test-BigIntegerOps)) {
+    exit 1
+}
+
+function ConvertTo-BigIntegerSafe([double]$value) {
+    if ($value -lt 0) { $value = 0 }
+    try {
+        if ($value -le [int64]::MaxValue) {
+            return [System.Numerics.BigInteger][int64][math]::Truncate($value)
+        }
+        return [System.Numerics.BigInteger]::Parse([math]::Truncate($value).ToString("F0"))
+    }
+    catch {
+        return [System.Numerics.BigInteger]::Parse([math]::Truncate($value).ToString("F0"))
+    }
+}
+
+function Get-ChunkKeyCount {
+    $raw = $keysPerSecond * $saveIntervalHours * 3600.0
+    $n = ConvertTo-BigIntegerSafe $raw
+    if ($n -lt 1) { $n = 1 }
+    return $n
+}
+
+function Get-SegmentSubCount(
+    [System.Numerics.BigInteger]$segStart,
+    [System.Numerics.BigInteger]$segEnd
+) {
+    if (!$autoSubSize) { return $subCount }
+
+    $total = $segEnd - $segStart + 1
+    $rawKeysPerSub = $keysPerSecond * $hoursPerSub * 3600.0
+    $keysPerSub = ConvertTo-BigIntegerSafe $rawKeysPerSub
+
+    if ($keysPerSub -le 0) { return $subCount }
+
+    $n = ($total + $keysPerSub - 1) / $keysPerSub
+
+    if ($n -lt 1) { return 1 }
+    if ($n -gt [int]::MaxValue) { return [int]::MaxValue }
+
+    return [int]$n
+}
+
+# ==================== HEX / RANGE ====================
 function HexToBig($h) {
     $clean = ($h -replace '\s', '').Trim()
     if ($clean -match '^0x') { $clean = $clean.Substring(2) }
@@ -188,38 +227,16 @@ function Get-SubRange(
     if ($subIndex -lt 0 -or $subIndex -ge $totalSubs) { throw "subIndex out of range" }
 
     $total = $segEnd - $segStart + 1
-    $subStart = $segStart + ([System.Numerics.BigInteger]$total * $subIndex) / $totalSubs
-    $subEnd   = $segStart + ([System.Numerics.BigInteger]$total * ($subIndex + 1)) / $totalSubs - 1
+    [System.Numerics.BigInteger]$bigSubIndex = $subIndex
+    [System.Numerics.BigInteger]$bigTotalSubs = $totalSubs
+
+    $subStart = $segStart + ($total * $bigSubIndex) / $bigTotalSubs
+    $subEnd   = $segStart + ($total * ($bigSubIndex + 1)) / $bigTotalSubs - 1
 
     if ($subStart -lt $segStart) { $subStart = $segStart }
     if ($subEnd -gt $segEnd) { $subEnd = $segEnd }
 
     return @{ Start = $subStart; End = $subEnd }
-}
-
-function Get-ChunkKeyCount {
-    $n = [int64]($keysPerSecond * $saveIntervalHours * 3600.0)
-    if ($n -lt 1) { $n = 1 }
-    return [System.Numerics.BigInteger]$n
-}
-
-function Get-SegmentSubCount(
-    [System.Numerics.BigInteger]$segStart,
-    [System.Numerics.BigInteger]$segEnd
-) {
-    if (!$autoSubSize) { return $subCount }
-
-    $total = $segEnd - $segStart + 1
-    $keysPerSub = [System.Numerics.BigInteger]([int64]($keysPerSecond * $hoursPerSub * 3600.0))
-
-    if ($keysPerSub -le 0) { return $subCount }
-
-    $n = ($total + $keysPerSub - 1) / $keysPerSub
-
-    if ($n -lt 1) { return 1 }
-    if ($n -gt [int]::MaxValue) { return [int]::MaxValue }
-
-    return [int]$n
 }
 
 function Get-RangeChunks(
@@ -234,7 +251,7 @@ function Get-RangeChunks(
     while ($pos -le $end) {
         $chunkEnd = $pos + $chunkSize - 1
         if ($chunkEnd -gt $end) { $chunkEnd = $end }
-        $list.Add(@{ Start = $pos; End = $chunkEnd }) | Out-Null
+        [void]$list.Add(@{ Start = $pos; End = $chunkEnd })
         $pos = $chunkEnd + 1
     }
     return $list
@@ -250,14 +267,76 @@ function Get-SubIndexForOffset(
     $total = $segEnd - $segStart + 1
     if ($total -le 0) { return 0 }
 
-    $idx = [int](([System.Numerics.BigInteger]$offset * $totalSubs) / $total)
+    [System.Numerics.BigInteger]$bigTotalSubs = $totalSubs
+    $idx = [int](($offset * $bigTotalSubs) / $total)
+
     if ($idx -ge $totalSubs) { $idx = $totalSubs - 1 }
     if ($idx -lt 0) { $idx = 0 }
 
     return $idx
 }
 
-# ==================== RESUME (FILE-LOCKED) ====================
+# ==================== FILE OPERATIONS ====================
+function Initialize-Directory([string]$path) {
+    if (!(Test-Path $path)) {
+        try {
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+        }
+        catch {
+            throw "Failed to create directory: $path - $($_.Exception.Message)"
+        }
+    }
+}
+
+function Test-DiskSpace([string]$path, [long]$requiredMB) {
+    $root = [System.IO.Path]::GetPathRoot($path)
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        Warn "Could not determine drive for disk space check: $path"
+        return
+    }
+    $drive = $root.TrimEnd('\')
+    $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction SilentlyContinue
+    if (!$disk) {
+        Warn "Could not query free disk space for $drive - continuing anyway"
+        return
+    }
+    $freeMB = [math]::Floor($disk.FreeSpace / 1MB)
+    if ($freeMB -lt $requiredMB) {
+        throw "Insufficient disk space on ${drive}. Required: ${requiredMB}MB, Available: ${freeMB}MB"
+    }
+}
+
+function Resolve-TargetFile {
+    if ($targetFile -and (Test-Path $targetFile)) {
+        if ($targetFile -match '\s') {
+            throw "Target file path cannot contain spaces: $targetFile"
+        }
+        return $targetFile
+    }
+
+    if (Test-Path $defaultTarget) { return $defaultTarget }
+
+    Initialize-Directory $targetDir
+
+    $found = @(Get-ChildItem -Path $suiteRoot -Recurse -Filter "hash160_sorted.bin" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch 'puzzle|_puzzle' })
+
+    if ($found.Count -ge 1) {
+        $pick = $found | Where-Object { $_.FullName -notmatch '\s' } | Select-Object -First 1
+        if (!$pick) {
+            throw "Found target file(s) but all contain spaces in path. KeyHunt requires paths without spaces."
+        }
+        if ($pick.FullName -ne $defaultTarget) {
+            Copy-Item -Path $pick.FullName -Destination $defaultTarget -Force
+            Info "Copied target to: $defaultTarget"
+        }
+        return $defaultTarget
+    }
+
+    return $null
+}
+
+# ==================== RESUME ====================
 function Parse-ResumeLine([string]$line) {
     if (!$line) { return $null }
     $line = $line.Trim()
@@ -296,18 +375,23 @@ function Get-MaxResumeEntry([string]$resumeFile, [int]$segIdx) {
 
     $best = $null
     $lines = @()
+    $fs = $null
+    $sr = $null
 
     try {
-        $fs = [System.IO.File]::Open($resumeFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $fs = [System.IO.File]::Open($resumeFile, [System.IO.FileMode]::Open,
+                                     [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
         $sr = New-Object System.IO.StreamReader($fs)
         while ($null -ne ($line = $sr.ReadLine())) {
             $lines += $line
         }
-        $sr.Close()
-        $fs.Close()
     }
     catch {
         $lines = @(Get-Content $resumeFile -ErrorAction SilentlyContinue)
+    }
+    finally {
+        if ($sr) { $sr.Close() }
+        if ($fs) { $fs.Close() }
     }
 
     foreach ($line in $lines) {
@@ -446,11 +530,13 @@ function Save-Resume(
 ) {
     $line = "$segIdx,$sub,$startHex,$endHex,$(Format-ScanStamp)"
     $endHexUpper = $endHex.ToUpper()
-
+    $acquired = $false
     $mutex = $null
+
     try {
         $mutex = New-Object System.Threading.Mutex($false, "Global\KeyHuntResume_$segIdx")
-        if (!$mutex.WaitOne(5000)) {
+        $acquired = $mutex.WaitOne(5000)
+        if (!$acquired) {
             Warn "Resume mutex timeout for SEG $segIdx - skipping write"
             return
         }
@@ -484,16 +570,38 @@ function Save-Resume(
     }
     finally {
         if ($mutex) {
-            [void]$mutex.ReleaseMutex()
+            if ($acquired) {
+                [void]$mutex.ReleaseMutex()
+            }
             $mutex.Dispose()
         }
     }
+}
+
+function Write-FoundHits([int]$segIdx, [int]$sub, [string]$outFile) {
+    if (!(Test-Path $outFile)) { return }
+
+    $hits = @(Get-Content $outFile -ErrorAction SilentlyContinue | Where-Object { $_.Trim() })
+    if ($hits.Count -eq 0) { return }
+
+    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    foreach ($hit in $hits) {
+        $foundMsg = "[{0}] SEG {1} SUB {2} | {3}" -f $stamp, $segIdx, $sub, $hit.Trim()
+        Add-Content -Path $foundLog -Value $foundMsg
+        Ok "FOUND: $($hit.Trim())"
+    }
+
+    Remove-Item -Path $outFile -Force -ErrorAction SilentlyContinue
 }
 
 # ==================== KEYHUNT ====================
 function Invoke-KeyHunt([string]$rangeStr, [string]$outFile, [string]$modeFlag) {
     if (!(Test-Path $exe)) {
         throw "KeyHunt executable not found: $exe"
+    }
+
+    if (Test-Path $outFile) {
+        Remove-Item -Path $outFile -Force -ErrorAction SilentlyContinue
     }
 
     $argList = @(
@@ -558,7 +666,7 @@ function Invoke-SchTasks([string[]]$schArgs) {
 
 function Register-AutoStartTask {
     if (!(Test-Path $scriptSelf)) {
-        Write-Host "Script not found: $scriptSelf" -ForegroundColor Red
+        Write-Error "Script not found: $scriptSelf"
         return $false
     }
 
@@ -571,6 +679,7 @@ function Register-AutoStartTask {
         $argString += " -suiteRoot `"$suiteRoot`""
     }
     if ($minFreeSpaceMB -ne 100) { $argString += " -minFreeSpaceMB $minFreeSpaceMB" }
+    if ($maxConsecutiveErrors -ne 5) { $argString += " -maxConsecutiveErrors $maxConsecutiveErrors" }
     if ($keyHuntRetries -ne 5) { $argString += " -keyHuntRetries $keyHuntRetries" }
     if ($keyHuntRetryDelaySeconds -ne 60) { $argString += " -keyHuntRetryDelaySeconds $keyHuntRetryDelaySeconds" }
     if ($restartDelaySeconds -ne 30) { $argString += " -restartDelaySeconds $restartDelaySeconds" }
@@ -608,7 +717,7 @@ function Register-AutoStartTask {
             -Trigger @($triggerBoot, $triggerLogon) `
             -Settings $settings `
             -Principal $principal `
-            -Description "KeyHunt v3.1 - auto-start after reboot, resume highest SUB per segment" | Out-Null
+            -Description "KeyHunt v3.4 - auto-start after reboot, resume highest SUB per segment" | Out-Null
     }
     catch {
         try {
@@ -619,65 +728,46 @@ function Register-AutoStartTask {
                 -Trigger $triggerLogon `
                 -Settings $settings `
                 -Principal $principal `
-                -Description "KeyHunt v3.1 - auto-start at logon, resume highest SUB per segment" | Out-Null
+                -Description "KeyHunt v3.4 - auto-start at logon, resume highest SUB per segment" | Out-Null
         }
         catch {
             Warn "Register-ScheduledTask failed; trying schtasks..."
             if (Register-AutoStartViaSchTasks $argString) { return $true }
-            Write-Host "Could not register scheduled task: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Error "Could not register scheduled task: $($_.Exception.Message)"
             return $false
         }
     }
 
-    Write-Host "Registered '$taskName' -> v3.ps1" -ForegroundColor Green
-    Write-Host "  startIndex=$startIndex saveIntervalHours=$saveIntervalHours mode=$mode"
+    Info "Registered '$taskName' -> v3.ps1"
+    Info "  startIndex=$startIndex saveIntervalHours=$saveIntervalHours mode=$mode"
     return $true
 }
 
 function Register-AutoStartViaSchTasks([string]$argString) {
-    $result = Invoke-SchTasks @('/Delete', '/TN', $taskName, '/F')
+    $null = Invoke-SchTasks @('/Delete', '/TN', $taskName, '/F')
     $tr = "powershell.exe $argString"
     $result = Invoke-SchTasks @('/Create', '/TN', $taskName, '/TR', $tr, '/SC', 'ONLOGON', '/RL', 'LIMITED', '/F')
     if ($result.Code -eq 0) {
-        Write-Host "Registered '$taskName' via schtasks (starts at logon)." -ForegroundColor Green
+        Info "Registered '$taskName' via schtasks (starts at logon)."
         return $true
     }
-    else {
-        Write-Host "schtasks failed: $($result.Output)" -ForegroundColor Red
-    }
+    Err "schtasks failed: $($result.Output)"
     return $false
 }
 
 function Unregister-AutoStartTask {
-    $result = Invoke-SchTasks @('/Delete', '/TN', $taskName, '/F')
+    $null = Invoke-SchTasks @('/Delete', '/TN', $taskName, '/F')
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existing) {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null
-        Write-Host "Removed '$taskName'." -ForegroundColor Green
+        Info "Removed '$taskName'."
     }
     else {
-        Write-Host "Task '$taskName' not found." -ForegroundColor Yellow
+        Warn "Task '$taskName' not found."
     }
 }
 
-if ($UnregisterAutoStart) {
-    Unregister-AutoStartTask
-    exit 0
-}
-
-if ($RegisterAutoStart) {
-    try {
-        $registered = Register-AutoStartTask
-        if (!$registered) {
-            Warn "Auto-start not registered; continuing with scan."
-        }
-    }
-    catch {
-        Warn "Auto-start registration failed: $($_.Exception.Message); continuing with scan."
-    }
-}
-
-# ==================== SCAN ====================
+# ==================== MAIN SCAN ====================
 function Run-Scan([bool]$explicitStartSub) {
     Initialize-Directory $scanDir
     Test-DiskSpace $scanDir $minFreeSpaceMB
@@ -702,7 +792,7 @@ function Run-Scan([bool]$explicitStartSub) {
     }
 
     $segments = @(Get-Content $segmentFile | Where-Object { $_.Trim() -and !$_.Trim().StartsWith("#") })
-    Info ("v3.1 | segments: {0} | floor: {1} | save+sub every {2}h | autoSubSize={3}" -f $segments.Count, $floorIndex, $saveIntervalHours, $autoSubSize)
+    Info ("v3.4 | segments: {0} | floor: {1} | save+sub every {2}h | autoSubSize={3}" -f $segments.Count, $floorIndex, $saveIntervalHours, $autoSubSize)
     Info "Resume: highest completed SUB per segment (stray low lines ignored)"
 
     $seg = $startIndex
@@ -855,19 +945,7 @@ function Run-Scan([bool]$explicitStartSub) {
                         return $exitCode
                     }
 
-                    if (Test-Path $outFile) {
-                        $hits = Get-Content $outFile -ErrorAction SilentlyContinue
-                        if ($hits) {
-                            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                            foreach ($hit in $hits) {
-                                if ($hit.Trim()) {
-                                    $foundMsg = "[{0}] SEG {1} SUB {2} | {3}" -f $stamp, $segIdx, $s, $hit
-                                    Add-Content -Path $foundLog -Value $foundMsg
-                                    Ok "FOUND: $hit"
-                                }
-                            }
-                        }
-                    }
+                    Write-FoundHits $segIdx $s $outFile
 
                     Save-Resume $resumeFile $segIdx $s ($startHex.ToUpper()) ($endHex.ToUpper())
                     Ok ("Saved SEG $segIdx SUB $s through $endHex")
@@ -891,51 +969,90 @@ function Run-Scan([bool]$explicitStartSub) {
     return 0
 }
 
-# ==================== RUNNER ====================
+# ==================== ENTRY POINT ====================
 $explicitStartSub = $PSBoundParameters.ContainsKey("startSub") -and $startSub -ge 0
 
+if ($UnregisterAutoStart) {
+    Unregister-AutoStartTask
+    exit 0
+}
+
+if ($RegisterAutoStart) {
+    try {
+        $registered = Register-AutoStartTask
+        if (!$registered) {
+            Warn "Auto-start not registered; continuing with scan."
+        }
+    }
+    catch {
+        Err "Auto-start registration failed: $($_.Exception.Message)"
+    }
+}
+
+try {
+    Initialize-Directory $wrapperDir
+    $targetFile = Resolve-TargetFile
+    if (!$targetFile -or !(Test-Path $targetFile)) {
+        throw "Target file not found. Copy hash160_sorted.bin to Data\btc\ or pass -targetFile"
+    }
+}
+catch {
+    Err "Initialization failed: $_"
+    exit 1
+}
+
 if ($RegisterAutoStart -and ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Info "Running with Administrator privileges - startup trigger should succeed"
+    Info "Running with Administrator privileges"
 }
 
 $mutex = New-Object System.Threading.Mutex($false, $mutexName)
 if (!$mutex.WaitOne(0)) {
-    Log "v3.1 already running."
+    Log "v3.4 already running."
     exit 2
 }
 
-Log ("v3.1 started | startIndex={0} | saveInterval={1}h | mode={2} | suiteRoot={3}" -f $startIndex, $saveIntervalHours, $mode, $suiteRoot)
+Log ("v3.4 started | startIndex={0} | saveInterval={1}h | mode={2} | suiteRoot={3}" -f $startIndex, $saveIntervalHours, $mode, $suiteRoot)
 
 $useExplicitSub = $explicitStartSub
 $consecutiveErrors = 0
-$maxConsecutiveErrors = 5
 
 while ($true) {
     try {
         $code = Run-Scan -explicitStartSub $useExplicitSub
         $useExplicitSub = $false
-        $consecutiveErrors = 0
 
         if ($code -eq 0) {
-            Log "v3.1 finished normally."
+            Log "v3.4 finished normally."
+            $global:ScriptExitCode = 0
+            $consecutiveErrors = 0
             break
         }
-        Log "v3.1 exit $code - retry in ${restartDelaySeconds}s (resume from highest SUB)"
-    }
-    catch {
+
         $consecutiveErrors++
-        Log "v3.1 error: $($_.Exception.Message) - retry in ${restartDelaySeconds}s (resume from highest SUB)"
+        Log "v3.4 exit $code - retry in ${restartDelaySeconds}s (resume from highest SUB)"
         Log "Consecutive errors: $consecutiveErrors/$maxConsecutiveErrors"
 
         if ($consecutiveErrors -ge $maxConsecutiveErrors) {
-            Log "Too many consecutive errors. Stopping."
+            Err "Too many consecutive errors. Stopping."
+            $global:ScriptExitCode = 1
             break
         }
+    }
+    catch {
+        $consecutiveErrors++
+        Err "v3.4 error: $($_.Exception.Message) - retry in ${restartDelaySeconds}s"
+        Log "Consecutive errors: $consecutiveErrors/$maxConsecutiveErrors"
 
+        if ($consecutiveErrors -ge $maxConsecutiveErrors) {
+            Err "Too many consecutive errors. Stopping."
+            $global:ScriptExitCode = 1
+            break
+        }
         $useExplicitSub = $false
     }
     Start-Sleep -Seconds $restartDelaySeconds
 }
 
 $mutex.ReleaseMutex()
-Log "v3.1 stopped."
+Log "v3.4 stopped with exit code $global:ScriptExitCode"
+exit $global:ScriptExitCode
