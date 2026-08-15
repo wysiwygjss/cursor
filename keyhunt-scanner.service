@@ -1,0 +1,40 @@
+[Unit]
+Description=KeyHunt-CUDA random chunk scanner
+# Optional: pin to after the NVIDIA driver / GPU is ready if you have such a
+# target/unit on your system. Harmless to leave as-is if you don't.
+After=network-online.target
+
+[Service]
+Type=simple
+User=%i
+# Adjust paths/tunables here instead of editing the script. Anything not set
+# falls back to the defaults documented at the top of keyhunt_random_scanner.sh.
+Environment=SCANNING_DIR=%h/Documents/keyhunt_cuda_sandbox
+ExecStart=/usr/bin/env bash %h/Documents/keyhunt_cuda_sandbox/keyhunt_random_scanner.sh
+
+# On `systemctl stop` / reboot, systemd sends SIGTERM and waits before
+# escalating to SIGKILL. The script's own trap stops the running segment,
+# checkpoints partial progress, and cleans up its lock within a couple of
+# seconds, so the default TimeoutStopSec is generous on purpose - avoid
+# lowering it much below the keyhunt process's own shutdown grace period.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Auto-restart after a transient crash (e.g. a driver hiccup), but do not
+# spin forever: the script's own circuit breaker already aborts with a
+# distinctive exit code after too many consecutive failures, and
+# StartLimitIntervalSec/StartLimitBurst below stop systemd from endlessly
+# relaunching a scanner that keeps failing immediately - check
+# `systemctl status` and the scanner's ALERTS.log if it ends up in that state.
+Restart=on-failure
+RestartSec=60
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+# Keep resource usage predictable over a months-long unattended run.
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target
