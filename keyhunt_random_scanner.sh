@@ -47,6 +47,13 @@
 #      (see the .service file next to this script) so it gets a clean
 #      restart after a genuine transient failure, without hiding a
 #      persistent one.
+#      Failure detection compares reported progress against the segment's
+#      key count, not elapsed time vs. SCAN_DURATION - a fast GPU can
+#      legitimately finish an entire segment well before the requested
+#      duration and exit cleanly; that's success, not a crash. If every
+#      segment finishes much faster than SCAN_DURATION on your hardware,
+#      consider raising DEFAULT_SEGMENT_SIZE so each GPU-kernel/bloom-filter
+#      startup amortizes over more actual scanning time.
 #
 # Usage:
 #   ./keyhunt_random_scanner.sh              # run the scanner loop (daemon)
@@ -365,10 +372,12 @@ close_inherited_locks_and_exec() {
     exec "$@"
 }
 
-# Runs one keyhunt segment. Returns 0 if it ran to completion/timeout (whether
-# or not a key was found - check $found_file yourself), or 2 if it exited
-# abnormally/early, which the caller treats as a hard failure for the
-# circuit breaker.
+# Runs one keyhunt segment. Returns 0 if it ran the full requested duration
+# (or found a key), or 2 if it exited before that - which is NOT necessarily
+# a failure (a fast GPU can legitimately finish its whole assigned segment
+# early). The caller (process_chunk) makes the actual failure determination
+# by comparing reported progress against the segment size, since elapsed
+# time alone can't distinguish "finished early" from "crashed early".
 #
 # Launched via plain `timeout` (no extra setsid session): GNU timeout already
 # puts the child in its own process group and forwards any signal it receives
@@ -419,7 +428,7 @@ run_keyhunt_segment() {
     [[ -s "$found_file" ]] && return 0
     (( elapsed >= SCAN_DURATION - 5 )) && return 0
 
-    log "WARN" "keyhunt exited after only ${elapsed}s (expected ~${SCAN_DURATION}s, exit=$exit_code) - treating as abnormal"
+    log "INFO" "keyhunt exited after only ${elapsed}s (expected ~${SCAN_DURATION}s, exit=$exit_code) - checking whether it covered its assigned range"
     return 2
 }
 
@@ -498,10 +507,27 @@ process_chunk() {
         LAST_SEGMENT_HAD_PROGRESS=0
     fi
 
-    if [[ "$rc" -eq 2 ]]; then
+    # A fast GPU can fully scan a segment well before SCAN_DURATION elapses -
+    # keyhunt then exits cleanly (exit 0) having covered its whole assigned
+    # range, which is a completed segment, not a failure. Only treat an
+    # early/short exit as abnormal if it did NOT actually cover the segment
+    # (e.g. the binary crashed or the driver faulted right away). Compare
+    # against the segment's own key count rather than elapsed time, since
+    # elapsed time alone can't tell "finished early" apart from "crashed
+    # early" - GPU throughput varies enormously across hardware.
+    local segment_size segment_fully_covered=0
+    segment_size="$(add "$(sub "$seg_end_int" "$current_start_int")" 1)"
+    if [[ "$checked" != "0" ]] && [[ "$(ge "$checked" "$segment_size")" -eq 1 ]]; then
+        segment_fully_covered=1
+    fi
+
+    if [[ "$rc" -eq 2 ]] && [[ "$segment_fully_covered" -eq 0 ]]; then
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
         log "WARN" "Chunk $chunk_num: abnormal exit (consecutive failures now $CONSECUTIVE_FAILURES)"
     else
+        if [[ "$rc" -eq 2 ]] && [[ "$segment_fully_covered" -eq 1 ]]; then
+            log "INFO" "Chunk $chunk_num: finished early because it covered its whole assigned range at this GPU's speed - not a failure"
+        fi
         CONSECUTIVE_FAILURES=0
     fi
 
