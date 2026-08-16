@@ -7,10 +7,19 @@ After=network-online.target
 [Service]
 Type=simple
 User=%i
+# NOTE: %h (home directory) does NOT work here. Since systemd 228, %h in a
+# *system* service always resolves to the home directory of the user running
+# the service manager (root for system units), never to the User= you set
+# below - this is documented systemd behavior, not a bug in this file. %i
+# (the instance name after the @) DOES resolve correctly, so we build the
+# path from it instead, assuming the standard /home/<user> layout. If your
+# user's home directory is somewhere else, replace /home/%i below with the
+# real absolute path.
+WorkingDirectory=/home/%i/Documents/keyhunt_cuda_sandbox
 # Adjust paths/tunables here instead of editing the script. Anything not set
 # falls back to the defaults documented at the top of keyhunt_random_scanner.sh.
-Environment=SCANNING_DIR=%h/Documents/keyhunt_cuda_sandbox
-ExecStart=/usr/bin/env bash %h/Documents/keyhunt_cuda_sandbox/keyhunt_random_scanner.sh
+Environment=SCANNING_DIR=/home/%i/Documents/keyhunt_cuda_sandbox
+ExecStart=/usr/bin/env bash /home/%i/Documents/keyhunt_cuda_sandbox/keyhunt_random_scanner.sh
 
 # On `systemctl stop` / reboot, systemd sends SIGTERM and waits before
 # escalating to SIGKILL. The script's own trap stops the running segment,
