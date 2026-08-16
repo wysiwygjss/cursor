@@ -4,6 +4,15 @@ Description=KeyHunt-CUDA random chunk scanner
 # target/unit on your system. Harmless to leave as-is if you don't.
 After=network-online.target
 
+# These belong in [Unit], not [Service] - systemd silently ignores them if
+# placed in [Service] (confirmed with `systemd-analyze verify`), which would
+# have meant the "stop retrying after repeated failures" protection below
+# was never actually active. Limits at most StartLimitBurst starts within
+# StartLimitIntervalSec; once exceeded, systemd stops retrying and marks the
+# unit failed instead of restart-looping forever.
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=%i
@@ -31,14 +40,12 @@ TimeoutStopSec=30
 
 # Auto-restart after a transient crash (e.g. a driver hiccup), but do not
 # spin forever: the script's own circuit breaker already aborts with a
-# distinctive exit code after too many consecutive failures, and
-# StartLimitIntervalSec/StartLimitBurst below stop systemd from endlessly
-# relaunching a scanner that keeps failing immediately - check
+# distinctive exit code after too many consecutive failures, and the
+# StartLimitIntervalSec/StartLimitBurst in [Unit] above stop systemd from
+# endlessly relaunching a scanner that keeps failing immediately - check
 # `systemctl status` and the scanner's ALERTS.log if it ends up in that state.
 Restart=on-failure
 RestartSec=60
-StartLimitIntervalSec=1800
-StartLimitBurst=5
 
 # Keep resource usage predictable over a months-long unattended run.
 Nice=5
