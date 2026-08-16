@@ -1,0 +1,56 @@
+[Unit]
+Description=KeyHunt-CUDA random chunk scanner
+# Optional: pin to after the NVIDIA driver / GPU is ready if you have such a
+# target/unit on your system. Harmless to leave as-is if you don't.
+After=network-online.target
+
+# These belong in [Unit], not [Service] - systemd silently ignores them if
+# placed in [Service] (confirmed with `systemd-analyze verify`), which would
+# have meant the "stop retrying after repeated failures" protection below
+# was never actually active. Limits at most StartLimitBurst starts within
+# StartLimitIntervalSec; once exceeded, systemd stops retrying and marks the
+# unit failed instead of restart-looping forever.
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=%i
+# NOTE: %h (home directory) does NOT work here. Since systemd 228, %h in a
+# *system* service always resolves to the home directory of the user running
+# the service manager (root for system units), never to the User= you set
+# below - this is documented systemd behavior, not a bug in this file. %i
+# (the instance name after the @) DOES resolve correctly, so we build the
+# path from it instead, assuming the standard /home/<user> layout. If your
+# user's home directory is somewhere else, replace /home/%i below with the
+# real absolute path.
+WorkingDirectory=/home/%i/Documents/keyhunt_cuda_sandbox
+# Adjust paths/tunables here instead of editing the script. Anything not set
+# falls back to the defaults documented at the top of keyhunt_random_scanner.sh.
+Environment=SCANNING_DIR=/home/%i/Documents/keyhunt_cuda_sandbox
+ExecStart=/usr/bin/env bash /home/%i/Documents/keyhunt_cuda_sandbox/keyhunt_random_scanner.sh
+
+# On `systemctl stop` / reboot, systemd sends SIGTERM and waits before
+# escalating to SIGKILL. The script's own trap stops the running segment,
+# checkpoints partial progress, and cleans up its lock within a couple of
+# seconds, so the default TimeoutStopSec is generous on purpose - avoid
+# lowering it much below the keyhunt process's own shutdown grace period.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Auto-restart after a transient crash (e.g. a driver hiccup), but do not
+# spin forever: the script's own circuit breaker already aborts with a
+# distinctive exit code after too many consecutive failures, and the
+# StartLimitIntervalSec/StartLimitBurst in [Unit] above stop systemd from
+# endlessly relaunching a scanner that keeps failing immediately - check
+# `systemctl status` and the scanner's ALERTS.log if it ends up in that state.
+Restart=on-failure
+RestartSec=60
+
+# Keep resource usage predictable over a months-long unattended run.
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target
