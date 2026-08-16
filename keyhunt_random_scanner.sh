@@ -101,6 +101,7 @@ BACKUP_RETENTION_COUNT="${BACKUP_RETENTION_COUNT:-30}"
 MAINTENANCE_INTERVAL_SECONDS="${MAINTENANCE_INTERVAL_SECONDS:-3600}" # 1h
 LOG_COMPRESS_AFTER_DAYS="${LOG_COMPRESS_AFTER_DAYS:-2}"
 LOG_DELETE_AFTER_DAYS="${LOG_DELETE_AFTER_DAYS:-30}"
+SCANNER_LOG_MAX_BYTES="${SCANNER_LOG_MAX_BYTES:-20971520}"  # 20MB, see rotate_logs
 
 SEGMENT_COMPLETION_TOLERANCE_PERCENT="${SEGMENT_COMPLETION_TOLERANCE_PERCENT:-1}" # see process_chunk
 STOP_ON_FOUND="${STOP_ON_FOUND:-1}"    # halt the whole scanner once a key is found anywhere
@@ -602,10 +603,31 @@ rotate_logs() {
     maintenance_due "$STATE_DIR/last_log_rotation" "$MAINTENANCE_INTERVAL_SECONDS" || return 0
     [[ -d "$LOG_DIR" ]] || return 0
 
+    # Per-segment keyhunt logs are written once and never touched again, so
+    # their mtime correctly ages past LOG_COMPRESS_AFTER_DAYS. scanner.log is
+    # excluded here and handled separately below by size instead.
     find "$LOG_DIR" -maxdepth 1 -name '*.log' ! -name 'scanner.log' -mtime "+${LOG_COMPRESS_AFTER_DAYS}" -print0 2>/dev/null \
         | xargs -0 -r gzip -f 2>/dev/null || true
     find "$LOG_DIR" -maxdepth 1 -name '*.log.gz' -mtime "+${LOG_DELETE_AFTER_DAYS}" -delete 2>/dev/null || true
     find "$LOCK_DIR" -maxdepth 1 -name '*.lock' -mtime "+${LOG_DELETE_AFTER_DAYS}" -delete 2>/dev/null || true
+
+    # scanner.log is continuously appended to for as long as this script
+    # runs, so its mtime is always "now" and the age-based rotation above
+    # would never trigger for it - over a run lasting many months (or
+    # longer) it would otherwise grow without bound. Rotate it by size
+    # instead: once it crosses SCANNER_LOG_MAX_BYTES, move it aside and
+    # compress it; the next log() call recreates a fresh scanner.log.
+    local scanner_log="$LOG_DIR/scanner.log" scanner_log_size rotated_log
+    if [[ -f "$scanner_log" ]]; then
+        scanner_log_size=$(stat -c%s "$scanner_log" 2>/dev/null || wc -c < "$scanner_log" 2>/dev/null || echo 0)
+        if [[ "$scanner_log_size" =~ ^[0-9]+$ ]] && (( scanner_log_size > SCANNER_LOG_MAX_BYTES )); then
+            rotated_log="${scanner_log}.$(date +%Y%m%d_%H%M%S)"
+            mv -f "$scanner_log" "$rotated_log"
+            gzip -f "$rotated_log" 2>/dev/null || true
+            log "INFO" "Rotated scanner.log (exceeded ${SCANNER_LOG_MAX_BYTES} bytes)"
+        fi
+    fi
+    find "$LOG_DIR" -maxdepth 1 -name 'scanner.log.*.gz' -mtime "+${LOG_DELETE_AFTER_DAYS}" -delete 2>/dev/null || true
 }
 
 ### ---------------------------------------------------------------------
