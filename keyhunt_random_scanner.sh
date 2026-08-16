@@ -23,6 +23,9 @@
 #      uncleanly (SIGKILL, OOM-killer, host crash) the *next* startup detects
 #      and kills any matching orphaned keyhunt process before starting new
 #      work, so a crash can never leave the GPU silently mining unattended.
+#      This orphan check only ever runs *after* the single-instance lock is
+#      successfully acquired, so it can never mistake another still-running,
+#      healthy instance (e.g. one already managed by systemd) for an orphan.
 #   3. savedchunks duplication: the original copied the whole per-chunk
 #      progress file to a brand-new timestamped file on every single
 #      attempt, so a chunk revisited 50 times over a few months produced 50
@@ -221,6 +224,12 @@ check_disk_space() {
 # "burning electricity for nothing, and nobody notices" failure mode). Every
 # run records the active PID in $KH_PID_FILE; on the next startup we check it
 # and kill any matching orphan before starting fresh work.
+#
+# IMPORTANT: must only be called *after* acquire_instance_lock() has
+# succeeded. Only holding the lock proves no other instance is currently
+# running - otherwise a PID recorded by a still-alive, perfectly healthy
+# instance (e.g. one already running under systemd) would be misidentified
+# as an orphan and killed by a second, redundant manual invocation.
 reap_orphaned_segment() {
     [[ -f "$KH_PID_FILE" ]] || return 0
     local pid
@@ -253,8 +262,6 @@ validate_environment() {
     mkdir -p "$SAVED_CHUNKS_DIR" "$SCANNED_CHUNKS_DIR" "$LOCK_DIR" "$LOG_DIR" "$STATE_DIR"
 
     check_disk_space || die "Need > ${MIN_FREE_SPACE_GB}GB free in $SCANNING_DIR"
-
-    reap_orphaned_segment
 
     if command -v nvidia-smi >/dev/null 2>&1; then
         log "INFO" "GPU: $(nvidia-smi --query-gpu=name,memory.used,memory.total,temperature.gpu,utilization.gpu --format=csv,noheader 2>/dev/null || echo 'nvidia-smi query failed')"
@@ -342,6 +349,22 @@ get_progress_count() {
     echo "${val:-0}"
 }
 
+# File descriptors bash opens (like our lock fds) are inherited by every
+# child process by default. If a spawned keyhunt/tail process kept a
+# duplicate of LOCK_FD or INSTANCE_LOCK_FD open, that lock would keep
+# looking "held" to the OS for as long as that child (or an orphaned
+# descendant of it) is alive - even long after this supervisor itself has
+# exited or been killed. That would deadlock the very orphan-reaper meant to
+# clean up after it: a fresh instance couldn't acquire the instance lock to
+# get far enough to reap the orphan holding it. Always launch child
+# processes through this helper (in a subshell, right before the final exec)
+# so they start with a clean fd table.
+close_inherited_locks_and_exec() {
+    [[ -n "$LOCK_FD" ]] && eval "exec ${LOCK_FD}>&-" 2>/dev/null
+    [[ -n "$INSTANCE_LOCK_FD" ]] && eval "exec ${INSTANCE_LOCK_FD}>&-" 2>/dev/null
+    exec "$@"
+}
+
 # Runs one keyhunt segment. Returns 0 if it ran to completion/timeout (whether
 # or not a key was found - check $found_file yourself), or 2 if it exited
 # abnormally/early, which the caller treats as a hard failure for the
@@ -359,17 +382,18 @@ run_keyhunt_segment() {
     rm -f "$found_file"
     : > "$log_file"
 
-    timeout --kill-after=15 "$SCAN_DURATION" "$KEYHUNT_BIN" \
-        -m "$KEYHUNT_MODE" --coin "$COIN" -i "$TARGETS_FILE" \
-        --range "${start_hex}:${end_hex}" \
-        -u -g --gpui "$GPU_INDEX" \
-        -o "$found_file" \
-        > "$log_file" 2>&1 &
+    (
+        close_inherited_locks_and_exec timeout --kill-after=15 "$SCAN_DURATION" "$KEYHUNT_BIN" \
+            -m "$KEYHUNT_MODE" --coin "$COIN" -i "$TARGETS_FILE" \
+            --range "${start_hex}:${end_hex}" \
+            -u -g --gpui "$GPU_INDEX" \
+            -o "$found_file"
+    ) > "$log_file" 2>&1 &
     KH_PID=$!
     echo "$KH_PID" > "$KH_PID_FILE" 2>/dev/null || true
 
     if command -v tail >/dev/null 2>&1; then
-        tail -n +1 -f "$log_file" --pid="$KH_PID" 2>/dev/null &
+        ( close_inherited_locks_and_exec tail -n +1 -f "$log_file" --pid="$KH_PID" ) 2>/dev/null &
         TAIL_PID=$!
     fi
 
@@ -801,6 +825,7 @@ main() {
         --once)
             validate_environment
             acquire_instance_lock
+            reap_orphaned_segment
             run_single_iteration
             exit $?
             ;;
@@ -815,6 +840,7 @@ main() {
 
     validate_environment
     acquire_instance_lock
+    reap_orphaned_segment
     main_loop
 }
 
