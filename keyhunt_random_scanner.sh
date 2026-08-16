@@ -102,6 +102,7 @@ MAINTENANCE_INTERVAL_SECONDS="${MAINTENANCE_INTERVAL_SECONDS:-3600}" # 1h
 LOG_COMPRESS_AFTER_DAYS="${LOG_COMPRESS_AFTER_DAYS:-2}"
 LOG_DELETE_AFTER_DAYS="${LOG_DELETE_AFTER_DAYS:-30}"
 
+SEGMENT_COMPLETION_TOLERANCE_PERCENT="${SEGMENT_COMPLETION_TOLERANCE_PERCENT:-1}" # see process_chunk
 STOP_ON_FOUND="${STOP_ON_FOUND:-1}"    # halt the whole scanner once a key is found anywhere
 # Refuses to run a second scanner against the same SCANNING_DIR (default: on).
 # If you run one instance per GPU, give each instance its own SCANNING_DIR
@@ -310,11 +311,21 @@ acquire_instance_lock() {
 ### ---------------------------------------------------------------------
 ### Chunk / checkpoint helpers
 ### ---------------------------------------------------------------------
+# Validates both hex fields here (rather than letting a malformed line reach
+# hex_to_int later) so one bad/corrupt line in a 10,000-line puzzle file
+# results in that single chunk being skipped and logged, not the whole
+# scanner crashing via hex_to_int's die() on invalid input.
 get_chunk_range() {
-    local chunk_num="$1" line
+    local chunk_num="$1" line s e
     line="$(sed -n "${chunk_num}p" "$PUZZLE_FILE")"
     [[ -n "$line" && "$line" == *:* ]] || return 1
-    printf '%s %s\n' "${line%%:*}" "${line##*:}"
+    s="${line%%:*}"
+    e="${line##*:}"
+    s="${s//[[:space:]]/}"
+    e="${e//[[:space:]]/}"
+    [[ "$s" =~ ^[0-9a-fA-F]+$ ]] || return 1
+    [[ "$e" =~ ^[0-9a-fA-F]+$ ]] || return 1
+    printf '%s %s\n' "$s" "$e"
 }
 
 get_last_scanned() {
@@ -442,7 +453,7 @@ process_chunk() {
 
     local range start_hex end_hex start_int end_int
     if ! range="$(get_chunk_range "$chunk_num")"; then
-        log "WARN" "Chunk $chunk_num: no usable data in puzzle file, skipping"
+        log "WARN" "Chunk $chunk_num: missing or malformed line in puzzle file (expected 'starthex:endhex'), skipping this chunk only"
         return 1
     fi
     start_hex="${range% *}"
@@ -515,9 +526,17 @@ process_chunk() {
     # against the segment's own key count rather than elapsed time, since
     # elapsed time alone can't tell "finished early" apart from "crashed
     # early" - GPU throughput varies enormously across hardware.
-    local segment_size segment_fully_covered=0
+    #
+    # A small tolerance (SEGMENT_COMPLETION_TOLERANCE_PERCENT, default 1%) is
+    # allowed below the exact segment size: keyhunt's progress log updates
+    # periodically, not on every single key, so the very last line printed
+    # before a clean exit can slightly understate the true final count.
+    # A genuine crash reports nowhere close to the segment size, so this
+    # tolerance doesn't meaningfully weaken failure detection.
+    local segment_size segment_fully_covered=0 completion_threshold
     segment_size="$(add "$(sub "$seg_end_int" "$current_start_int")" 1)"
-    if [[ "$checked" != "0" ]] && [[ "$(ge "$checked" "$segment_size")" -eq 1 ]]; then
+    completion_threshold="$(bc_calc "($segment_size * (100 - $SEGMENT_COMPLETION_TOLERANCE_PERCENT)) / 100")"
+    if [[ "$checked" != "0" ]] && [[ "$(ge "$checked" "$completion_threshold")" -eq 1 ]]; then
         segment_fully_covered=1
     fi
 
@@ -627,7 +646,7 @@ cmd_status() {
     [[ -f "$STATE_DIR/FOUND" ]] && echo ">>> FOUND marker is set - a key was found <<<"
     if [[ -f "$PUZZLE_FILE" ]]; then
         local total
-        total=$(wc -l < "$PUZZLE_FILE")
+        total=$(awk 'END{print NR}' "$PUZZLE_FILE")
         echo "Chunks fully complete: $(count_completed_chunks) / $total"
     fi
     if [[ -f "$SCANNING_DIR/ALERTS.log" ]]; then
@@ -679,6 +698,33 @@ cmd_self_test() {
         echo "[FAIL] seg_end=$seg_end next_start=$next_start (expected 1249 / 1250)"
         failures=$((failures+1))
     fi
+
+    echo "== line counting (no trailing newline must not lose the last chunk) =="
+    local tmp_no_nl count
+    tmp_no_nl="$(mktemp)"
+    printf '1:2\n3:4\n5:6' > "$tmp_no_nl"
+    count=$(awk 'END{print NR}' "$tmp_no_nl")
+    if [[ "$count" == "3" ]]; then
+        echo "[OK]   3-line file without trailing newline counted as 3"
+    else
+        echo "[FAIL] counted as $count, expected 3 - last chunk would be unreachable"
+        failures=$((failures+1))
+    fi
+    rm -f "$tmp_no_nl"
+
+    echo "== malformed puzzle line must not crash the scanner =="
+    local saved_puzzle_file="$PUZZLE_FILE" tmp_bad_puzzle
+    tmp_bad_puzzle="$(mktemp)"
+    printf 'not-valid-hex:also-not-valid\n' > "$tmp_bad_puzzle"
+    PUZZLE_FILE="$tmp_bad_puzzle"
+    if get_chunk_range 1 >/dev/null 2>&1; then
+        echo "[FAIL] malformed line was accepted instead of rejected"
+        failures=$((failures+1))
+    else
+        echo "[OK]   malformed line correctly rejected (chunk would be skipped, not crash)"
+    fi
+    PUZZLE_FILE="$saved_puzzle_file"
+    rm -f "$tmp_bad_puzzle"
 
     echo "== files =="
     [[ -f "$PUZZLE_FILE" ]] && echo "[OK]   puzzle file: $PUZZLE_FILE" || echo "[WARN] puzzle file missing: $PUZZLE_FILE"
@@ -782,7 +828,10 @@ run_one_iteration() {
 }
 
 init_loop_state() {
-    CHUNK_COUNT=$(wc -l < "$PUZZLE_FILE")
+    # awk counts the final line even without a trailing newline; `wc -l`
+    # would silently undercount by 1 in that case, permanently hiding the
+    # last chunk in the puzzle file from the random picker.
+    CHUNK_COUNT=$(awk 'END{print NR}' "$PUZZLE_FILE")
     (( CHUNK_COUNT > 0 )) || die "Puzzle file has no chunks: $PUZZLE_FILE"
     CONSECUTIVE_FAILURES=0
     ZERO_PROGRESS_STREAK=0
